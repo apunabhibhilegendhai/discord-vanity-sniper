@@ -629,6 +629,12 @@ func (g *Gateway) checkVanityREST() {
 	}
 }
 
+func (g *Gateway) IsConnected() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.conn != nil
+}
+
 func (g *Gateway) Stop() {
 	// Close the conn first so a blocked ReadMessage (running in the reader
 	// goroutine) returns immediately and listen()'s main loop can observe stop.

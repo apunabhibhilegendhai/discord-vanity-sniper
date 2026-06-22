@@ -89,18 +89,29 @@ func TestLiveClaim(t *testing.T) {
 	claimer := NewClaimer(target, cfg, []*ConnPool{pool}, mfa, stats, wh, rl,
 		cfg.BurstCount, cfg.GuardMode, cfg.GuardReclaimMax, cfg.GuardReclaimBackoffMS, nil)
 
-	// ---- 2. Warm the MFA token (measure solve latency) --------------------
-	// EnsureValid returns instantly if a cached token exists in session_state;
-	// otherwise it blocks on getTicket + /mfa/finish. In production the
-	// background pre-solver keeps this warm, so a fast return here is the
-	// realistic hot-path precondition.
+	// ---- 2. Warm the MFA token (background pre-solver) --------------------
+	// Start the background pre-solver (same goroutine as production) so the
+	// token is warmed without blocking the test. WaitForToken mimics the
+	// production path firstClaim uses on cold start: it blocks until the
+	// pre-solver produces a token, matching the real sniper behavior.
+	mfaStop := make(chan struct{})
+	defer close(mfaStop)
+	go mfa.StartRefresh(&chanCancel{ch: mfaStop})
+
 	mfaT0 := time.Now()
-	ok := mfa.EnsureValid()
+	mfaName, mfaValue := mfa.WaitForToken(20 * time.Second)
 	mfaLatency := time.Since(mfaT0)
-	if !ok {
-		t.Fatalf("MFA EnsureValid failed (method=%s) — cannot claim without a token", mfa.Method())
+	if mfaName == "" {
+		// Fallback: synchronous solve if background pre-solver isn't done
+		if !mfa.EnsureValid() {
+			t.Fatalf("MFA failed after WaitForToken timeout (method=%s)", mfa.Method())
+		}
+		mfaName, mfaValue = mfa.GetHeader()
 	}
-	t.Logf("MFA EnsureValid: ok=%v latency=%dms", ok, mfaLatency.Milliseconds())
+	if mfaName == "" {
+		t.Fatalf("no MFA token (method=%s)", mfa.Method())
+	}
+	t.Logf("MFA token ready in %dms", mfaLatency.Milliseconds())
 
 	// ---- 3. Fire the claim hot path ---------------------------------------
 	// firstClaim is the exact entry point the gateway signal triggers in

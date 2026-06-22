@@ -75,6 +75,8 @@ func NewMFAHandler(target *Target, session *SessionStore, globalPassword, totpSe
 	// If a token is already loaded from session cache, close tokenReady immediately
 	// so WaitForToken returns without blocking.
 	if h.token != "" {
+		log.Printf("[mfa %s] loaded cached MFA token from session (valid for %s remaining)",
+			target.Vanity, time.Until(h.expiresAt).Round(time.Second))
 		close(h.tokenReady)
 	}
 
@@ -617,38 +619,8 @@ func (m *MFAHandler) StartRefresh(ctx CancelContext) {
 			refreshWithin = 90 * time.Second
 		)
 
-		// Wait briefly before the first solve so the gateway's initial
-		// identify/resume handshake finishes first. The pre-solve fires a
-		// TLS-protected request to Discord, which opens a new TLS session —
-		// overlapping too many of those with the gateway's own connection and
-		// the pool warm-up dials can trip Cloudflare's per-IP new-TLS-session
-		// rate limit ("tls: internal error"). With the pool warm-up now running
-		// concurrently (see orchestrator.warmPoolsParallel), the pools finish in
-		// ~3.5s; the gateway takes ~2s to go from identify to READY. A 2s
-		// delay here means the first MFA solve starts ~2s after launch, which
-		// is well after the bulk of the pool dials and avoids TLS contention with
-		// the gateway handshake. The gateway is still connecting at this point,
-		// so the first GUILD_UPDATE can't arrive before ~3s anyway — a 2s MFA
-		// delay costs nothing.
-		time.Sleep(2 * time.Second)
-
-		// Prime the cache after the delay so the first availability signal has a
-		// warm token to read — don't wait up to 90s for the first tick.
-		m.mu.Lock()
-		prime := m.token == "" || time.Now().Add(refreshWithin).After(m.expiresAt)
-		m.mu.Unlock()
-		primeStart := time.Now()
-		if prime {
-			refresh()
-			log.Printf("[mfa %s] primed in %s", m.target.Vanity, time.Since(primeStart))
-		}
-
-		method := "totp"
-		if m.totpSecret == "" {
-			method = "password"
-		}
-		log.Printf("[mfa %s] %s pre-solve active (interval=%s, refresh-within=%s)",
-			m.target.Vanity, method, tickInterval, refreshWithin)
+		log.Printf("[mfa %s] pre-solve active (interval=%s, refresh-within=%s)",
+			m.target.Vanity, tickInterval, refreshWithin)
 
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()

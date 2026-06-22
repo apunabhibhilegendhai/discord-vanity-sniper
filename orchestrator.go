@@ -25,6 +25,7 @@ type Orchestrator struct {
 	webhook  *WebhookSender
 	rateLim  *RateLimiter
 	sessions *SessionStore
+	cliMode  bool // set true when interactive CLI is active (disables dashboard)
 }
 
 func NewOrchestrator(cfg *Conf) *Orchestrator {
@@ -47,6 +48,16 @@ func NewOrchestrator(cfg *Conf) *Orchestrator {
 			t := &cfg.Targets[i]
 
 			mfa := NewMFAHandler(t, sessions, cfg.Password, cfg.TOTPSecret, cfg.BackupCodes, &cfg.Fingerprint)
+
+			// Prime MFA token synchronously before pools/gateway start, so the
+			// first availability signal has a warm token to read. Without this,
+			// the background pre-solver (StartRefresh) races the gateway connect
+			// and the claim hot path falls back to a synchronous solve, delaying
+			// the burst by ~10s. This matches how S-pectral and other snipers
+			// solve MFA once upfront.
+			if !mfa.EnsureValid() {
+				log.Printf("[target %s] WARNING: MFA prime failed — hot path may need fallback solve", t.Vanity)
+			}
 
 		// Build one warm pool per proxy entry. t.Proxies is guaranteed non-empty
 		// by config.LoadConfig (it defaults to [""] when omitted), and "" is the
@@ -134,7 +145,9 @@ func (o *Orchestrator) Run() {
 		})
 	}
 
-	o.dashboard()
+	if !o.cliMode {
+		o.dashboard()
+	}
 }
 
 func (o *Orchestrator) dashboard() {

@@ -17,6 +17,7 @@ var processStartTime = time.Now()
 
 func main() {
 	configPath := flag.String("config", "config.json", "path to config file")
+	noCLI := flag.Bool("no-cli", false, "disable interactive CLI (daemon mode)")
 	flag.Parse()
 
 	cfg, err := LoadConfig(*configPath)
@@ -53,7 +54,17 @@ func main() {
 
 	go orch.Run()
 
-	<-sig
+	if !*noCLI {
+		orch.cliMode = true
+		cli := NewCLI(orch)
+		go cli.Run()
+		select {
+		case <-sig:
+		case <-cli.Done():
+		}
+	} else {
+		<-sig
+	}
 	orch.Shutdown()
 }
 
