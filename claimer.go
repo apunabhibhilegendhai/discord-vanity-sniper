@@ -216,7 +216,6 @@ func NewClaimer(t *Target, cfg *Conf, pools []*ConnPool, mfa *MFAHandler, stats 
 
 	c.armSentries()
 	c.startBackgroundPublish()
-	c.startPoller()
 	return c
 }
 
@@ -233,7 +232,7 @@ func (c *Claimer) armSentries() {
 	}
 }
 
-// startPoller launches the 30ms GET polling loop in a goroutine. The poller
+// startPoller launches the 5ms GET polling loop in a goroutine. The poller
 // monitors the guild's vanity URL independently of the gateway and signals the
 // same available channel when the target becomes free.
 func (c *Claimer) startPoller() {
@@ -297,8 +296,8 @@ func (c *Claimer) fire() *fireSignal {
 		epoch:   c.fireEpoch.Add(1),
 		results: make([]int32, c.burstCount),
 	}
-	c.activeFire.Store(sig)
 	c.epT1 = time.Now()
+	c.activeFire.Store(sig)
 	return sig
 }
 
@@ -698,6 +697,7 @@ func (c *Claimer) SignalAvailable() {
 
 func (c *Claimer) Run() {
 	defer close(c.done)
+	c.startPoller()
 
 	for {
 		select {

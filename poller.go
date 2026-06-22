@@ -12,14 +12,14 @@ import (
 // claimer's available channel the moment the target vanity becomes free.
 //
 // It maintains ONE persistent TLS socket (keepalive) and writes a tiny 6-header
-// GET request every ~30ms. When the response shows the guild's vanity_url_code
+// GET request every ~5ms. When the response shows the guild's vanity_url_code
 // is no longer our target (or is empty/null), it pushes a timestamp to the
 // available channel so the claimer fires the burst immediately — no gateway
 // GUILD_UPDATE propagation delay.
 //
 // The GET loop runs in parallel with the WebSocket gateway. The gateway still
 // provides GUILD_UPDATE events (which also feed available), but the poller
-// catches changes ~50-200ms faster because it polls at 30ms with no server-side
+// catches changes ~5-30ms faster because it polls at 5ms with no server-side
 // event batching. The two sources are complementary: whichever fires first wins.
 type Poller struct {
 	guildID string
@@ -57,12 +57,12 @@ func NewPoller(guildID, vanity, token, ua, sp string, available chan<- time.Time
 	}
 }
 
-// Run starts the 30ms polling loop. Blocks until stop is signaled. Spawn in a
+// Run starts the 5ms polling loop. Blocks until stop is signaled. Spawn in a
 // goroutine.
 func (p *Poller) Run() {
 	defer close(p.done)
 
-	const baseInterval = 30 * time.Millisecond
+	const baseInterval = 5 * time.Millisecond
 
 	for {
 		select {
@@ -86,12 +86,9 @@ func (p *Poller) Run() {
 
 		p.poll()
 
-		// Jitter: [-5ms, +5ms] on 30ms base to avoid deterministic pattern
-		jitter := time.Duration(rand.Intn(10)-5) * time.Millisecond
+		// Micro-jitter: [-1ms, +1ms] on 5ms base to avoid deterministic pattern
+		jitter := time.Duration(rand.Intn(3)-1) * time.Millisecond
 		sleepFor := baseInterval + jitter
-		if sleepFor < 10*time.Millisecond {
-			sleepFor = 10 * time.Millisecond
-		}
 
 		select {
 		case <-p.stop:
