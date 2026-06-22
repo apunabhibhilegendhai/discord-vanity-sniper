@@ -30,8 +30,8 @@ jobs:
             "password": "${{ secrets.PASSWORD }}",
             "email": "${{ secrets.EMAIL }}",
             "backup_codes": [],
-            "burst_count": 3,
-            "warm_connections": 3,
+            "burst_count": 1,
+            "warm_connections": 1,
             "session_path": "session_state.json",
             "guard_mode": false,
             "targets": [
