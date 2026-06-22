@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"strings"
@@ -11,7 +10,7 @@ import (
 type CLI struct {
 	orch    *Orchestrator
 	done    chan struct{}
-	reader  *bufio.Reader
+	lineCh  chan string
 	sniperStarted bool
 }
 
@@ -19,12 +18,29 @@ func NewCLI(orch *Orchestrator) *CLI {
 	return &CLI{
 		orch:   orch,
 		done:   make(chan struct{}),
-		reader: bufio.NewReader(os.Stdin),
+		lineCh: make(chan string, 1),
 	}
 }
 
 func (c *CLI) Done() <-chan struct{} {
 	return c.done
+}
+
+// readLine reads one line from stdin into lineCh.
+func (c *CLI) readLine() {
+	go func() {
+		buf := make([]byte, 4096)
+		n, err := os.Stdin.Read(buf)
+		if err != nil {
+			close(c.lineCh)
+			return
+		}
+		line := strings.TrimRight(string(buf[:n]), "\r\n")
+		select {
+		case c.lineCh <- line:
+		default:
+		}
+	}()
 }
 
 func (c *CLI) Run() {
@@ -41,7 +57,6 @@ func (c *CLI) Run() {
 		len(c.orch.cfg.Targets), c.orch.cfg.BurstCount, c.orch.cfg.GuardMode)
 	fmt.Println("MFA caching automatically in background...")
 
-	// Wait a moment for initial MFA prime to show in logs
 	time.Sleep(500 * time.Millisecond)
 
 	for {
@@ -54,13 +69,13 @@ func (c *CLI) Run() {
 		fmt.Println("──────────────────────────────────────")
 		fmt.Print("Select (1-4): ")
 
-		line, err := c.reader.ReadString('\n')
-		if err != nil {
+		c.readLine()
+		line, ok := <-c.lineCh
+		if !ok {
 			return
 		}
-		line = strings.TrimSpace(line)
 
-		switch line {
+		switch strings.TrimSpace(line) {
 		case "1":
 			c.startSniper()
 		case "2":
@@ -71,7 +86,9 @@ func (c *CLI) Run() {
 			fmt.Println("Shutting down...")
 			return
 		default:
-			fmt.Printf("Unknown option: %q\n", line)
+			if line != "" {
+				fmt.Printf("Unknown option: %q\n", line)
+			}
 		}
 	}
 }
@@ -91,8 +108,10 @@ func (c *CLI) startSniper() {
 
 	t := &c.orch.cfg.Targets[0]
 	fmt.Printf("Target vanity code (Enter for '%s'): ", t.Vanity)
-	line, err := c.reader.ReadString('\n')
-	if err != nil {
+
+	c.readLine()
+	line, ok := <-c.lineCh
+	if !ok {
 		return
 	}
 	vanity := strings.TrimSpace(line)
@@ -113,24 +132,16 @@ func (c *CLI) startSniper() {
 	fmt.Printf("Sniper started for '%s'. Press ENTER anytime for menu.\n", t.Vanity)
 	fmt.Println()
 
-	interrupt := make(chan struct{})
-	go func() {
-		buf := make([]byte, 1)
-		for {
-			os.Stdin.Read(buf)
-			if buf[0] == '\n' {
-				close(interrupt)
-				return
-			}
-		}
-	}()
-
+	// readLine feeds lineCh; any input returns to menu
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-interrupt:
+		case _, ok := <-c.lineCh:
+			if !ok {
+				return
+			}
 			fmt.Println()
 			return
 		case <-ticker.C:
@@ -160,7 +171,6 @@ func (c *CLI) printStatusLine() {
 
 func (c *CLI) toggleGuard() {
 	c.orch.cfg.GuardMode = !c.orch.cfg.GuardMode
-	// Update runner guardEnabled flag too
 	for _, rn := range c.orch.runners {
 		rn.target.mu.Lock()
 		if c.orch.cfg.GuardMode {
