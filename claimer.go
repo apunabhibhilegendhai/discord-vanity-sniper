@@ -670,8 +670,17 @@ func (c *Claimer) publishBytes() bool {
 //
 // Also publishes the fallback template bytes for the dual-endpoint retry.
 func (c *Claimer) publishBytesWithName(mfaName, mfaValue string) bool {
-	buf := RenderClaimBytesWith(c.tpl, mfaName, mfaValue)
-	if buf == nil {
+	// If we have an MFA token, publish with the MFA header. Otherwise fall back
+	// to a no-MFA request — the guild may not require MFA for admin actions,
+	// and Discord accepts the PATCH without the header. If it returns 60003,
+	// the sentry / runOnce path will solve MFA on the fly and re-publish.
+	var buf []byte
+	if mfaName != "" && mfaValue != "" {
+		buf = RenderClaimBytesWith(c.tpl, mfaName, mfaValue)
+	} else {
+		buf = c.tpl.BuildNoMFA()
+	}
+	if buf == nil || len(buf) == 0 {
 		return false
 	}
 	c.currentBytes.Store(&buf)
@@ -679,7 +688,12 @@ func (c *Claimer) publishBytesWithName(mfaName, mfaValue string) bool {
 	// Also publish fallback bytes so the dual-endpoint retry in the sentry has
 	// pre-rendered bytes ready (no synchronous render on the retry path).
 	if c.fallbackTpl != nil {
-		fb := RenderClaimBytesWith(c.fallbackTpl, mfaName, mfaValue)
+		var fb []byte
+		if mfaName != "" && mfaValue != "" {
+			fb = RenderClaimBytesWith(c.fallbackTpl, mfaName, mfaValue)
+		} else {
+			fb = c.fallbackTpl.BuildNoMFA()
+		}
 		if fb != nil {
 			c.currentFallbackBytes.Store(&fb)
 		}
@@ -770,13 +784,19 @@ func (c *Claimer) firstClaim() {
 			}
 		}
 		if mfaName == "" {
-			log.Printf("[claim %s] ❌ could not obtain MFA token — skipping claim (will retry on next signal)", c.target.Vanity)
-			return
-		}
-		log.Printf("[claim %s] synchronous MFA token, publishing bytes", c.target.Vanity)
-		if !c.publishBytesWithName(mfaName, mfaValue) {
-			log.Printf("[claim %s] ❌ could not build claim bytes — skipping (will retry on next signal)", c.target.Vanity)
-			return
+			log.Printf("[claim %s] no MFA token available — trying without MFA header (guild may not require MFA)", c.target.Vanity)
+			if c.publishBytesWithName("", "") {
+				log.Printf("[claim %s] published no-MFA claim bytes", c.target.Vanity)
+			} else {
+				log.Printf("[claim %s] ❌ could not build claim bytes — skipping (will retry on next signal)", c.target.Vanity)
+				return
+			}
+		} else {
+			log.Printf("[claim %s] synchronous MFA token, publishing bytes", c.target.Vanity)
+			if !c.publishBytesWithName(mfaName, mfaValue) {
+				log.Printf("[claim %s] ❌ could not build claim bytes — skipping (will retry on next signal)", c.target.Vanity)
+				return
+			}
 		}
 	} else {
 		log.Printf("[claim %s] using pre-published claim bytes", c.target.Vanity)

@@ -310,7 +310,19 @@ func (m *MFAHandler) getTicket() (string, error) {
 	// inherit the updated device id / _cfuvid. setTicketCookies merges by name.
 	m.setTicketCookies(extractSetCookies(resp))
 
-	return extractTicket(resp)
+	ticket, err := extractTicket(resp)
+	if err != nil {
+		// Log the actual response so we can see what Discord returned instead
+		// of 60003 (e.g. 200 OK — guild doesn't require MFA, 403 — no
+		// permission, 429 — rate limited, or an HTML error page from Cloudflare).
+		respSnippet := extractBody(resp)
+		if len(respSnippet) > 200 {
+			respSnippet = respSnippet[:200]
+		}
+		log.Printf("[mfa %s] getTicket failed: %v (status=%d, body=%s)",
+			m.target.Vanity, err, parseStatusCode(resp), respSnippet)
+	}
+	return ticket, err
 }
 
 func sendSolveRequest(req string) []byte {
