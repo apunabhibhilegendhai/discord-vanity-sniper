@@ -92,8 +92,50 @@ func TestBuildClaimMFARendersCorrectHeaders(t *testing.T) {
 		}
 		headerLines++
 	}
-	if headerLines != 8 {
-		t.Errorf("expected 8 header lines (got %d): request-line + Host + Auth + SP + MFA + CT + CL + UA", headerLines)
+	if headerLines != 9 {
+		t.Errorf("expected 9 header lines (got %d): request-line + Host + Auth + SP + MFA + CT + CL + UA + Connection", headerLines)
+	}
+}
+
+func TestExtractVanityCode(t *testing.T) {
+	tests := []struct {
+		name string
+		resp string
+		want string
+	}{
+		{
+			name: "vanity set to target",
+			resp: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 21\r\n\r\n{\"code\":\"deltafinal\"}",
+			want: "deltafinal",
+		},
+		{
+			name: "no vanity (null)",
+			resp: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"code\":null}",
+			want: "",
+		},
+		{
+			name: "different vanity set",
+			resp: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"code\":\"other\"}",
+			want: "other",
+		},
+		{
+			name: "empty code string",
+			resp: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\n\r\n{\"code\":\"\"}",
+			want: "",
+		},
+		{
+			name: "no body",
+			resp: "HTTP/1.1 200 OK\r\n\r\n",
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractVanityCode([]byte(tt.resp))
+			if got != tt.want {
+				t.Errorf("extractVanityCode = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

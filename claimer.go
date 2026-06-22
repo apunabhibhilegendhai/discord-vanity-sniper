@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,17 +122,19 @@ type Claimer struct {
 	firstSuccessOnce sync.Once
 	reclaimMode      bool
 
-	// Pre-armed sentry machinery. Sentries are spawned once at NewClaimer and
-	// live for the claimer's lifetime; each owns one warm conn from its assigned
-	// pool. fireCh is closed to broadcast a fire; a fresh channel replaces it.
-	// currentBytes holds the full PATCH bytes; rebuilt once per token rotation.
-	// activeResults is the results channel sentries report to for the in-flight
-	// burst; set under fireMu immediately before the fire channel is closed so a
-	// sentry that wakes on the close reads a consistent channel.
-	fireMu         sync.Mutex
-	fireCh         chan struct{}
-	activeResults  chan bool
-	currentBytes   atomic.Pointer[[]byte]
+	// Fire mechanism: atomic epoch counter. fire() increments the epoch and
+	// stores a fireSignal containing per-sentry result slots. Sentries spin-read
+	// activeFire; when the epoch changes, they fire. This eliminates channel
+	// close + goroutine scheduling latency from the wake→write critical path.
+	fireEpoch    atomic.Uint64
+	activeFire   atomic.Pointer[fireSignal]
+	currentBytes atomic.Pointer[[]byte]
+
+	// fallbackBytes holds pre-built PATCH bytes for the legacy dual-endpoint
+	// fallback (PATCH /api/v9/guilds/{id} with duplicate keys). Published
+	// alongside currentBytes by the background publish goroutine. Sentries try
+	// the fallback when the primary endpoint returns 10008/404/400.
+	currentFallbackBytes atomic.Pointer[[]byte]
 
 	// tpl is the PATCH request template (prefix + placeholder MFA slot + suffix),
 	// built ONCE at NewClaimer from the immutable target+cfg. publishBytesWithName
@@ -141,7 +144,25 @@ type Claimer struct {
 	// is safe to cache.
 	tpl *ClaimRequest
 
+	// fallbackTpl is the same concept but for the legacy dual-endpoint PATCH:
+	// PATCH /api/v9/guilds/{id} with body {"code":"vanity","vanity_code":"vanity"}.
+	// Only used when the primary endpoint returns a non-fatal error.
+	fallbackTpl *ClaimRequest
+
+	poller   *Poller
+	pollerWG sync.WaitGroup
+
 	sentryWG sync.WaitGroup
+}
+
+// fireSignal carries the per-sentry result slots for one claim burst. The
+// orchestrator allocates one per fire(); sentries write their boolean result
+// into their assigned slot using 0/1/-1 tri-state (0=not-yet, 1=success,
+// -1=failure). The orchestrator spins on the slots until all are non-zero.
+// Zero allocation after the fire call itself: results is pre-allocated once.
+type fireSignal struct {
+	epoch   uint64
+	results []int32
 }
 
 // NewClaimer constructs a Claimer and arms its sentry workers. pools must have
@@ -183,6 +204,7 @@ func NewClaimer(t *Target, cfg *Conf, pools []*ConnPool, mfa *MFAHandler, stats 
 		rateLim:        rl,
 		guard:          guard,
 		tpl:            BuildClaimRequest(t, cfg),
+		fallbackTpl:    BuildFallbackClaimRequest(t, cfg),
 		available:      make(chan time.Time, 10),
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -190,10 +212,11 @@ func NewClaimer(t *Target, cfg *Conf, pools []*ConnPool, mfa *MFAHandler, stats 
 		guardEnabled:   guardEnabled,
 		reclaimMax:     max,
 		reclaimBackoff: backoff,
-		fireCh:         make(chan struct{}),
 	}
 
 	c.armSentries()
+	c.startBackgroundPublish()
+	c.startPoller()
 	return c
 }
 
@@ -206,50 +229,93 @@ func (c *Claimer) armSentries() {
 	for i := 0; i < c.burstCount; i++ {
 		pool := c.pools[i%len(c.pools)]
 		c.sentryWG.Add(1)
-		go c.sentry(pool)
+		go c.sentry(pool, i)
 	}
 }
 
-// fire broadcasts a claim to all sentries by closing the current fire channel
-// and replacing it with a fresh one. Returns the channel the sentries will
-// report results on. The caller must drain exactly burstCount results.
-func (c *Claimer) fire() chan bool {
-	results := make(chan bool, c.burstCount)
-	c.fireMu.Lock()
-	fire := c.fireCh
-	c.fireCh = make(chan struct{})
-	// Publish the results channel under the same lock window as the fire swap,
-	// and BEFORE closing fire, so a sentry that wakes on the close reads a
-	// consistent results channel.
-	c.activeResults = results
-	c.fireMu.Unlock()
-	c.epT1 = time.Now() // T1: fire broadcast (bytes published, sentries about to wake)
-	close(fire)
-	return results
+// startPoller launches the 30ms GET polling loop in a goroutine. The poller
+// monitors the guild's vanity URL independently of the gateway and signals the
+// same available channel when the target becomes free.
+func (c *Claimer) startPoller() {
+	if c.tpl == nil {
+		return
+	}
+	c.poller = NewPoller(
+		c.target.GuildID,
+		c.target.Vanity,
+		c.target.Token,
+		c.cfg.Fingerprint.UserAgent,
+		c.cfg.Fingerprint.SuperPropsB64,
+		c.available,
+		c.stop,
+	)
+	c.pollerWG.Add(1)
+	go func() {
+		defer c.pollerWG.Done()
+		c.poller.Run()
+	}()
 }
 
-// sentry is a persistent claim worker. It owns one warm conn and loops:
-// block on fire → write current bytes → read response → report result →
-// refresh conn → re-block. It lives for the claimer's lifetime, so the fire
-// path is: read atomic bytes → conn.Write. No spawn, no pool lock, no template
-// build on the critical line.
+// startBackgroundPublish keeps the claim PATCH bytes fresh by re-rendering
+// them every time the MFA token is refreshed. Runs in a background goroutine
+// so the hot path (firstClaim/reclaim) can fire without calling publishBytes.
 //
-// Held-conn staleness: a sentry grabs its warm conn at arm time and holds it
-// idle until the next fire. Cloudflare silently half-closes idle TLS conns
-// after ~15s (the kernel still accepts the Write, but the server discards it
-// and the read returns EOF with no HTTP status — the "empty response" symptom).
-// The cold-start window alone (pool warm-up + gateway READY + MFA solve) is
-// ~15s, so every first-claim burst used to hit a stale conn. isConnAlive can't
-// detect this (a half-closed conn is open locally → probe times out → "alive").
+// The goroutine immediately publishes at startup (if a cached session token
+// exists) and re-publishes every 1s thereafter. firstClaim/reclaim still have
+// a synchronous fallback: if currentBytes is nil at fire time (cold start
+// before any solve completes or before the first tick), they fall through to
+// the old GetHeader+WaitForToken+publishBytesWithName synchronous flow.
+func (c *Claimer) startBackgroundPublish() {
+	go func() {
+		// Immediate publish on start: cached token → bytes ready before signal.
+		c.publishBytes()
+
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-c.stop:
+				return
+			case <-ticker.C:
+				c.publishBytes()
+			}
+		}
+	}()
+}
+
+// fire broadcasts a claim to all sentries by atomically incrementing the fire
+// epoch and publishing a fireSignal with pre-allocated result slots. Sentries
+// spin-read activeFire; when the epoch changes, they fire. The orchestrator
+// polls the result slots until all sentries report.
 //
-// Fix: track connAcquiredAt and refresh the held conn if it's been idle longer
-// than maxIdleAge (10s, comfortably under the ~15s server limit). The refresh
-// runs on the wake→write path but ONLY when the conn is actually stale — after
-// the first claim, runOnce replaces the conn via pool.Get() on retry, so
-// connAcquiredAt is freshly stamped and steady-state fires skip the refresh
-// (time.Since < maxIdleAge). The zero-lock hot path is preserved in steady
-// state; the cost is paid only on cold start where a stale conn is guaranteed.
-func (c *Claimer) sentry(pool *ConnPool) {
+// No channels, no mutex, no goroutine scheduling dependency on the wake→write
+// path. The sentries are already running (busy-polling), so the signal reaches
+// them within microseconds of the atomic store.
+func (c *Claimer) fire() *fireSignal {
+	sig := &fireSignal{
+		epoch:   c.fireEpoch.Add(1),
+		results: make([]int32, c.burstCount),
+	}
+	c.activeFire.Store(sig)
+	c.epT1 = time.Now()
+	return sig
+}
+
+// sentry is a persistent claim worker that busy-polls an atomic fire epoch.
+// When the epoch changes (fire() was called), it reads the pre-built bytes,
+// writes them to its warm conn, reads the response, and writes its boolean
+// result to the slot assigned at arm time. No channel, no mutex, no goroutine
+// scheduling dependency between the fire signal and the first conn.Write.
+//
+// The spin loop uses runtime.Gosched() to yield the OS thread between polls so
+// the sentry doesn't peg a CPU core at 100% during idle periods. When a fire
+// lands, the sentry sees the new epoch within microseconds.
+//
+// conn staleness: the age guard (maxIdleAge) refreshes conns idle >10s to
+// avoid Cloudflare's silent half-close. With HTTP keepalive (P1), the conn is
+// reused across fires; the age guard still applies between widely-spaced fires.
+func (c *Claimer) sentry(pool *ConnPool, idx int) {
 	defer c.sentryWG.Done()
 
 	// Grab the initial warm conn. A failure here is non-fatal — the sentry will
@@ -257,100 +323,85 @@ func (c *Claimer) sentry(pool *ConnPool) {
 	conn, _ := pool.Get()
 	connAcquiredAt := time.Now()
 
-	// Track the fire channel we're currently blocked on so we can detect when a
-	// new fire has been issued (channel changed) versus a stale wakeup.
-	c.fireMu.Lock()
-	fire := c.fireCh
-	c.fireMu.Unlock()
+	// Persistent read buffer for this sentry's lifetime.
+	readBuf := make([]byte, 4096)
+
+	// Track the last fire epoch we processed. Starts at 0 so the first fire
+	// (epoch >= 1) is always detected.
+	lastEpoch := uint64(0)
 
 	for {
-		// Block until fired or stopped. A close(fire) wakes all sentries at once.
+		// Non-blocking stop check at the top of every spin iteration.
 		select {
-		case <-fire:
 		case <-c.stop:
 			if conn != nil {
 				conn.Close()
 			}
 			return
+		default:
 		}
 
-		// Read the results channel for this burst under the lock (consistent
-		// with the fire swap in fire()).
-		c.fireMu.Lock()
-		results := c.activeResults
-		c.fireMu.Unlock()
+		// Busy-poll: load the current fire signal. If the epoch hasn't changed,
+		// yield and retry. This is the wake path: the atomic load and compare
+		// complete in nanoseconds; runtime.Gosched() relaxes the CPU between
+		// polls to avoid starving other goroutines.
+		sig := c.activeFire.Load()
+		if sig == nil || sig.epoch == lastEpoch {
+			runtime.Gosched()
+			continue
+		}
+		lastEpoch = sig.epoch
 
-		// HOT PATH: atomic load of pre-built bytes, then immediate write. No
-		// lock, no probe, no allocation between wake and wire.
+		// HOT PATH: atomic load of pre-built bytes, then immediate write.
 		bytesPtr := c.currentBytes.Load()
 		if bytesPtr == nil || len(*bytesPtr) == 0 {
-			// No bytes published (e.g. MFA token not ready at fire time). Report
-			// failure so the episode's drain count is correct.
-			if results != nil {
-				results <- false
-			}
-			// Re-arm on the latest fire channel and wait for the next fire.
-			c.fireMu.Lock()
-			fire = c.fireCh
-			c.fireMu.Unlock()
+			atomic.StoreInt32(&sig.results[idx], -1)
 			continue
 		}
 		reqBuf := *bytesPtr
 
-		// Ensure we have a conn. If the previous one was spent/closed, grab a
-		// fresh warm one now. This is OFF the critical wake→write line for the
-		// common case (conn is warm from the previous cycle).
 		if conn == nil {
 			conn, _ = pool.Get()
 			connAcquiredAt = time.Now()
 		}
-
-		// Held-conn staleness guard: if the conn has been idle longer than
-		// maxIdleAge, Cloudflare has almost certainly half-closed it server-side.
-		// The isConnAlive probe below cannot detect this (the conn is still open
-		// locally), so we refresh by AGE first. This is the cold-start fix: a
-		// sentry armed at startup holds its conn across pool warm-up + gateway
-		// READY + MFA solve (~15s), which exceeds the ~15s server idle limit.
-		// Steady-state fires see a conn freshly replaced by runOnce's retry, so
-		// time.Since(connAcquiredAt) is small and this branch is skipped.
 		if conn != nil && time.Since(connAcquiredAt) > maxIdleAge {
 			conn.Close()
 			conn, _ = pool.Get()
 			connAcquiredAt = time.Now()
 		}
 
-		// Defense in depth: probe the held conn right before writing. This
-		// catches conns the server hard-reset (RST/EOF) — a disjoint failure
-		// mode from the idle half-close above, which the age guard already
-		// handles. The O(1) past-deadline probe (see isConnAlive) costs
-		// ~nothing on the hot path.
-		if conn != nil && !isConnAlive(conn) {
-			conn.Close()
-			conn, _ = pool.Get()
-			connAcquiredAt = time.Now()
+		ok := c.runOnce(pool, &conn, reqBuf, 0, readBuf)
+
+		// Dual-endpoint fallback: if the primary PATCH to /vanity-url failed
+		// with a non-fatal error (10008/404/400), try the legacy endpoint:
+		// PATCH /api/v9/guilds/{id} with {"code":"vanity","vanity_code":"vanity"}.
+		// This hits an older Discord code path that sometimes accepts the request
+		// when the primary endpoint returns generic errors.
+		if !ok && c.fallbackTpl != nil {
+			fbPtr := c.currentFallbackBytes.Load()
+			if fbPtr != nil && len(*fbPtr) > 0 {
+				fbBuf := *fbPtr
+				if conn == nil {
+					conn, _ = pool.Get()
+					connAcquiredAt = time.Now()
+				}
+				if conn != nil {
+					ok = c.runOnce(pool, &conn, fbBuf, 1, readBuf)
+				}
+			}
 		}
 
-		ok := c.runOnce(pool, &conn, reqBuf, 0)
-
-		// runOnce may have replaced conn on a retry (pool.Get on fresh conn).
-		// Re-stamp the acquisition time so the staleness guard above reflects
-		// the conn we actually hold, not the one we entered with.
 		if conn == nil {
-			// conn was closed and not replaced; the next loop iteration's
-			// nil-check will re-acquire and stamp.
+			// closed by runOnce error path; next iteration re-acquires
 		} else {
 			connAcquiredAt = time.Now()
 		}
 
-		// Report the result for this burst (if a results channel is registered).
-		if results != nil {
-			results <- ok
+		if ok {
+			atomic.StoreInt32(&sig.results[idx], 1)
+		} else {
+			atomic.StoreInt32(&sig.results[idx], -1)
 		}
-
-		// Re-arm on the latest fire channel for the next burst.
-		c.fireMu.Lock()
-		fire = c.fireCh
-		c.fireMu.Unlock()
 	}
 }
 
@@ -362,7 +413,7 @@ func (c *Claimer) sentry(pool *ConnPool) {
 //
 // conn is *Conn (a pointer-to-pointer in the sentry so it can be replaced on
 // retry); reqBuf is the pre-built PATCH bytes.
-func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt int) bool {
+func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt int, readBuf []byte) bool {
 	conn := *connPtr
 	rlKey := c.target.GuildID
 
@@ -406,7 +457,7 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 			fresh, ferr := pool.Get()
 			if ferr == nil {
 				*connPtr = fresh
-				return c.runOnce(pool, connPtr, reqBuf, attempt+1)
+				return c.runOnce(pool, connPtr, reqBuf, attempt+1, readBuf)
 			}
 		}
 		return false
@@ -419,7 +470,6 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 	writeDone := time.Now()
 
 	var resp []byte
-	readBuf := respBufPool.Get().([]byte)
 	bodyLen := -1
 	curr := conn
 	for {
@@ -430,11 +480,23 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 		if err != nil {
 			break
 		}
+		headerEnd := bytes.Index(resp, []byte("\r\n\r\n"))
+		if headerEnd < 0 {
+			continue
+		}
 		if bodyLen < 0 {
 			bodyLen = contentLength(resp)
 		}
-		headerEnd := bytes.Index(resp, []byte("\r\n\r\n"))
-		if headerEnd < 0 {
+		status := parseStatusCode(resp)
+		if status == 200 || status == 204 {
+			if bodyLen >= 0 {
+				want := headerEnd + 4 + bodyLen
+				if len(resp) >= want {
+					break
+				}
+			} else {
+				break
+			}
 			continue
 		}
 		isChunked := bytes.Contains(resp, []byte("Transfer-Encoding: chunked"))
@@ -451,7 +513,6 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 			break
 		}
 	}
-	respBufPool.Put(readBuf)
 
 	// Empty response: server closed the idle pooled conn before we read. Close,
 	// then retry once on a fresh conn so a poisoned pool entry doesn't lose the
@@ -465,7 +526,7 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 			fresh, ferr := pool.Get()
 			if ferr == nil {
 				*connPtr = fresh
-				return c.runOnce(pool, connPtr, reqBuf, attempt+1)
+				return c.runOnce(pool, connPtr, reqBuf, attempt+1, readBuf)
 			}
 		}
 		return false
@@ -481,13 +542,24 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 	c.epT2 = writeDone
 	c.epT3 = time.Now()
 
+	if statusOK {
+		// HTTP keepalive: Discord sends Connection: keep-alive by default; only
+		// close if the response explicitly asks for it. Keeping the conn alive
+		// eliminates pool.Get() mutex contention and TLS session resume on the
+		// next fire — the sentry reuses the same TCP+TLS conn.
+		if !connectionClose(resp) {
+			c.fireFirstSuccess(true)
+			return true
+		}
+	}
+
+	// Close the conn for all non-keepalive paths (failure, or server-requested
+	// close on success). On failure the sentry's nil-check triggers pool.Get()
+	// for a fresh conn on the next fire.
 	conn.Close()
 	*connPtr = nil
 
 	if statusOK {
-		// AUTHORITATIVE success gate: a 2xx from PATCH /vanity-url means Discord
-		// accepted the claim. (Body can be {"code":null} on a 200, so we don't
-		// gate on the body echoing the target code.)
 		c.fireFirstSuccess(true)
 		return true
 	}
@@ -529,7 +601,7 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 				return false
 			}
 			*connPtr = fresh
-			return c.runOnce(pool, connPtr, *bytesPtr, attempt+1)
+			return c.runOnce(pool, connPtr, *bytesPtr, attempt+1, readBuf)
 		}
 	}
 
@@ -552,7 +624,7 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 					return false
 				}
 				*connPtr = fresh
-				return c.runOnce(pool, connPtr, *bytesPtr, attempt+1)
+				return c.runOnce(pool, connPtr, *bytesPtr, attempt+1, readBuf)
 			}
 		}
 	}
@@ -596,12 +668,24 @@ func (c *Claimer) publishBytes() bool {
 // episode. Returns false if the template is missing or no usable token was
 // supplied (caller must bail rather than fire a bare PATCH, which Discord's
 // anti-abuse filter rejects with 403/10008).
+//
+// Also publishes the fallback template bytes for the dual-endpoint retry.
 func (c *Claimer) publishBytesWithName(mfaName, mfaValue string) bool {
 	buf := RenderClaimBytesWith(c.tpl, mfaName, mfaValue)
 	if buf == nil {
 		return false
 	}
 	c.currentBytes.Store(&buf)
+
+	// Also publish fallback bytes so the dual-endpoint retry in the sentry has
+	// pre-rendered bytes ready (no synchronous render on the retry path).
+	if c.fallbackTpl != nil {
+		fb := RenderClaimBytesWith(c.fallbackTpl, mfaName, mfaValue)
+		if fb != nil {
+			c.currentFallbackBytes.Store(&fb)
+		}
+	}
+
 	return true
 }
 
@@ -665,55 +749,55 @@ func (c *Claimer) firstClaim() {
 	c.resetSuccessGate(false)
 	log.Printf("[claim %s] vanity available! claiming...", c.target.Vanity)
 
-	// On cold start the MFA pre-solver may not have produced a token yet. We
-	// MUST have a valid MFA token before firing — a bare PATCH returns
-	// 403/10008, not the 60003 ticket we'd need for a retry.
+	// Background publish (startBackgroundPublish) keeps bytes fresh in a 1s
+	// ticker. In steady state, the bytes are already published and we fire
+	// immediately — no GetHeader, no WaitForToken, no publishBytes on the
+	// critical path.
 	//
-	// We thread both name AND value through to publishBytesWithName so the
-	// publish step skips a second GetHeader mutex acquire — one less lock on
-	// the wake→wire path. The value is only valid if the token didn't rotate
-	// between fetch and publish; publishBytesWithName re-checks via the cached
-	// template + the supplied value, and returns false if stale/empty.
-	mfaName, mfaValue := c.mfa.GetHeader()
-	if mfaName == "" {
-		log.Printf("[claim %s] no MFA token cached, waiting up to 15s for pre-solver...", c.target.Vanity)
-		mfaName, mfaValue = c.mfa.WaitForToken(15 * time.Second)
-	}
-	if mfaName == "" {
-		log.Printf("[claim %s] pre-solver slow — solving MFA synchronously...", c.target.Vanity)
-		if c.mfa.EnsureValid() {
-			mfaName, mfaValue = c.mfa.GetHeader()
+	// Cold-start fallback: if the background goroutine hasn't produced bytes
+	// yet (pre-solver not done, or first tick hasn't fired), do the old
+	// synchronous GetHeader + WaitForToken + publishBytesWithName flow.
+	if c.currentBytes.Load() == nil {
+		mfaName, mfaValue := c.mfa.GetHeader()
+		if mfaName == "" {
+			log.Printf("[claim %s] no MFA token cached, waiting up to 15s for pre-solver...", c.target.Vanity)
+			mfaName, mfaValue = c.mfa.WaitForToken(15 * time.Second)
 		}
-	}
-	if mfaName == "" {
-		log.Printf("[claim %s] ❌ could not obtain MFA token — skipping claim (will retry on next signal)", c.target.Vanity)
-		return
-	}
-	log.Printf("[claim %s] MFA token ready, firing burst", c.target.Vanity)
-
-	// Publish the bytes ONCE for all sentries to read atomically. Pass the
-	// header we already hold so publishBytesWithName doesn't re-acquire the
-	// MFA mutex.
-	if !c.publishBytesWithName(mfaName, mfaValue) {
-		log.Printf("[claim %s] ❌ could not build claim bytes — skipping (will retry on next signal)", c.target.Vanity)
-		return
+		if mfaName == "" {
+			log.Printf("[claim %s] pre-solver slow — solving MFA synchronously...", c.target.Vanity)
+			if c.mfa.EnsureValid() {
+				mfaName, mfaValue = c.mfa.GetHeader()
+			}
+		}
+		if mfaName == "" {
+			log.Printf("[claim %s] ❌ could not obtain MFA token — skipping claim (will retry on next signal)", c.target.Vanity)
+			return
+		}
+		log.Printf("[claim %s] synchronous MFA token, publishing bytes", c.target.Vanity)
+		if !c.publishBytesWithName(mfaName, mfaValue) {
+			log.Printf("[claim %s] ❌ could not build claim bytes — skipping (will retry on next signal)", c.target.Vanity)
+			return
+		}
+	} else {
+		log.Printf("[claim %s] using pre-published claim bytes", c.target.Vanity)
 	}
 
 	c.runBurst()
 }
 
-// runBurst fires all sentries and drains their results. Returns true if any
+// runBurst fires all sentries and polls their result slots. Returns true if any
 // worker reported a 200. Shared by firstClaim and reclaim. The first 200 fires
 // the success handler inside runOnce (via fireFirstSuccess) so the operator is
 // notified before the remaining sentries drain.
 func (c *Claimer) runBurst() bool {
-	results := c.fire()
+	sig := c.fire()
 	success := false
 	for i := 0; i < c.burstCount; i++ {
-		if ok := <-results; ok {
+		for atomic.LoadInt32(&sig.results[i]) == 0 {
+			runtime.Gosched()
+		}
+		if sig.results[i] == 1 {
 			success = true
-			// Don't break: drain remaining sentries so we don't deadlock them
-			// (they each do one buffered send per fire).
 		}
 	}
 	return success
@@ -754,10 +838,10 @@ func (c *Claimer) reclaim() {
 	c.resetSuccessGate(true)
 
 	for attempt := 0; attempt < c.reclaimMax; attempt++ {
-		// Thread the header value through to publishBytesWithName so the
-		// publish step skips a redundant GetHeader mutex acquire — one less
-		// lock per reclaim attempt.
-		mfaName, mfaValue := c.mfa.GetHeader()
+		// Background publish keeps bytes fresh. If they're ready, fire
+		// immediately. Cold-start fallback: synchronous publish if not.
+		if c.currentBytes.Load() == nil {
+			mfaName, mfaValue := c.mfa.GetHeader()
 			if mfaName == "" {
 				mfaName, mfaValue = c.mfa.WaitForToken(10 * time.Second)
 			}
@@ -766,20 +850,19 @@ func (c *Claimer) reclaim() {
 					mfaName, mfaValue = c.mfa.GetHeader()
 				}
 			}
-		if mfaName == "" {
-			log.Printf("[guard %s] no MFA token, skipping reclaim attempt %d", c.target.Vanity, attempt+1)
-			continue
+			if mfaName == "" {
+				log.Printf("[guard %s] no MFA token, skipping reclaim attempt %d", c.target.Vanity, attempt+1)
+				continue
+			}
+			if !c.publishBytesWithName(mfaName, mfaValue) {
+				log.Printf("[guard %s] could not build claim bytes, skipping attempt %d", c.target.Vanity, attempt+1)
+				continue
+			}
 		}
 
 		c.target.mu.Lock()
 		c.target.reclaimAttempts = attempt + 1
 		c.target.mu.Unlock()
-
-		// Publish fresh bytes for this attempt (token may have rotated).
-		if !c.publishBytesWithName(mfaName, mfaValue) {
-			log.Printf("[guard %s] could not build claim bytes, skipping attempt %d", c.target.Vanity, attempt+1)
-			continue
-		}
 
 		ok := c.runBurst()
 		if ok {
@@ -949,8 +1032,8 @@ func (c *Claimer) isDirectBlocked() bool {
 
 func (c *Claimer) Stop() {
 	close(c.stop)
-	// Don't wait on sentryWG here: sentries select on c.stop and will exit on
-	// their own; waiting could deadlock if a sentry is mid-Write. The done
+	// The poller and sentries select on c.stop and will exit on their own;
+	// waiting on them here could deadlock if a sentry is mid-Write. The done
 	// channel (closed by Run on stop) is the join point the orchestrator waits on.
 	<-c.done
 }
@@ -986,6 +1069,20 @@ func parseStatusCode(resp []byte) int {
 func isStatusOK(resp []byte) bool {
 	c := parseStatusCode(resp)
 	return c >= 200 && c < 300
+}
+
+// connectionClose returns true if the HTTP response explicitly sets
+// "Connection: close", meaning the server will close the TCP conn after
+// this response. HTTP/1.1 defaults to keepalive, so absence of the header
+// means the conn is reusable.
+func connectionClose(resp []byte) bool {
+	headerEnd := bytes.Index(resp, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return true // incomplete response — be safe and assume close
+	}
+	headerBlock := resp[:headerEnd]
+	return bytes.Contains(headerBlock, []byte("Connection: close")) ||
+		bytes.Contains(headerBlock, []byte("connection: close"))
 }
 
 // buildCookieHeader assembles the Cookie header value for the claim PATCH from

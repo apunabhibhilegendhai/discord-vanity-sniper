@@ -87,6 +87,7 @@ func BuildClaimRequest(t *Target, cfg *Conf) *ClaimRequest {
 	fmt.Fprintf(sb, "Content-Type: application/json\r\n")
 	fmt.Fprintf(sb, "Content-Length: %d\r\n", len(body))
 	fmt.Fprintf(sb, "User-Agent: %s\r\n", cfg.Fingerprint.UserAgent)
+	sb.WriteString("Connection: keep-alive\r\n")
 	sb.WriteString("\r\n")
 	sb.WriteString(body)
 
@@ -109,6 +110,46 @@ func BuildClaimRequest(t *Target, cfg *Conf) *ClaimRequest {
 		prefix:    prefix,
 		mfaSuffix: suffix,
 		noMFA:     noMFA,
+	}
+}
+
+// BuildFallbackClaimRequest builds a template for the legacy dual-endpoint
+// fallback: PATCH /api/v9/guilds/{guild_id} with body {"code":"vanity","vanity_code":"vanity"}.
+// Some Discord API versions accept this where /vanity-url returns 10008/404.
+func BuildFallbackClaimRequest(t *Target, cfg *Conf) *ClaimRequest {
+	body := fmt.Sprintf(`{"code":"%s","vanity_code":"%s"}`, t.Vanity, t.Vanity)
+
+	sb := new(strings.Builder)
+
+	fmt.Fprintf(sb, "PATCH /api/v9/guilds/%s HTTP/1.1\r\n", t.GuildID)
+	fmt.Fprintf(sb, "Host: discord.com\r\n")
+	fmt.Fprintf(sb, "Authorization: %s\r\n", t.Token)
+	if cfg.Fingerprint.SuperPropsB64 != "" {
+		fmt.Fprintf(sb, "X-Super-Properties: %s\r\n", cfg.Fingerprint.SuperPropsB64)
+	}
+
+	mfaSlotEnd := sb.Len()
+	sb.WriteString("X-Discord-MFA: XXXXXX\r\n")
+
+	fmt.Fprintf(sb, "Content-Type: application/json\r\n")
+	fmt.Fprintf(sb, "Content-Length: %d\r\n", len(body))
+	fmt.Fprintf(sb, "User-Agent: %s\r\n", cfg.Fingerprint.UserAgent)
+	sb.WriteString("Connection: keep-alive\r\n")
+	sb.WriteString("\r\n")
+	sb.WriteString(body)
+
+	buf := []byte(sb.String())
+
+	prefix := make([]byte, mfaSlotEnd)
+	copy(prefix, buf[:mfaSlotEnd])
+
+	afterMFA := mfaSlotEnd + len("X-Discord-MFA: XXXXXX\r\n")
+	suffix := make([]byte, len(buf)-afterMFA)
+	copy(suffix, buf[afterMFA:])
+
+	return &ClaimRequest{
+		prefix:    prefix,
+		mfaSuffix: suffix,
 	}
 }
 
@@ -154,6 +195,7 @@ func buildNoMFARequest(t *Target, cfg *Conf, body string) []byte {
 	fmt.Fprintf(sb, "Content-Type: application/json\r\n")
 	fmt.Fprintf(sb, "Content-Length: %d\r\n", len(body))
 	fmt.Fprintf(sb, "User-Agent: %s\r\n", cfg.Fingerprint.UserAgent)
+	sb.WriteString("Connection: keep-alive\r\n")
 	sb.WriteString("\r\n")
 	sb.WriteString(body)
 	return []byte(sb.String())
