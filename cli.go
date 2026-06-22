@@ -90,34 +90,27 @@ func (c *CLI) startSniper() {
 	}
 
 	t := &c.orch.cfg.Targets[0]
-	current := t.Vanity
-
-	fmt.Printf("Target vanity code (Enter for '%s'): ", current)
+	fmt.Printf("Target vanity code (Enter for '%s'): ", t.Vanity)
 	line, err := c.reader.ReadString('\n')
 	if err != nil {
 		return
 	}
 	vanity := strings.TrimSpace(line)
-	if vanity == "" {
-		vanity = current
-	}
-	fmt.Printf("Starting sniper for '%s'...\n", vanity)
 
-	if vanity != current {
+	if vanity != "" && vanity != t.Vanity {
 		t.mu.Lock()
 		t.Vanity = vanity
 		t.claimed = false
 		t.mu.Unlock()
-
-		oldKey := c.orch.cfg.Targets[0].GuildID + ":" + current
-		newKey := c.orch.cfg.Targets[0].GuildID + ":" + vanity
-		if ts := c.orch.sessions.Get(oldKey); ts != nil {
-			c.orch.sessions.Set(newKey, ts)
-		}
 	}
 
 	c.sniperStarted = true
-	fmt.Println("Sniper running. Press ENTER anytime for menu.")
+	if err := c.orch.StartTarget(0); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		c.sniperStarted = false
+		return
+	}
+	fmt.Printf("Sniper started for '%s'. Press ENTER anytime for menu.\n", t.Vanity)
 	fmt.Println()
 
 	interrupt := make(chan struct{})

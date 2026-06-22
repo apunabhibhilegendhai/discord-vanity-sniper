@@ -16,6 +16,7 @@ type TargetRunner struct {
 	mfa     *MFAHandler
 	guard   *Guard
 	mfaCancel chan struct{}
+	started   bool // true after Start() launches gateway + claimer
 }
 
 type Orchestrator struct {
@@ -105,8 +106,6 @@ func NewOrchestrator(cfg *Conf) *Orchestrator {
 		}
 		o.runners = append(o.runners, runner)
 
-		go claimer.Run()
-		go gateway.Run()
 		go mfa.StartRefresh(mfaCancel)
 
 		proxyCount := len(pools)
@@ -220,6 +219,23 @@ func proxyLabel(proxy string) string {	if proxy == "" {
 	return proxy
 }
 
+func (r *TargetRunner) Start() {
+	if r.started {
+		return
+	}
+	r.started = true
+	go r.claimer.Run()
+	go r.gateway.Run()
+}
+
+func (o *Orchestrator) StartTarget(idx int) error {
+	if idx < 0 || idx >= len(o.runners) {
+		return fmt.Errorf("invalid target index %d (have %d)", idx, len(o.runners))
+	}
+	o.runners[idx].Start()
+	return nil
+}
+
 func (o *Orchestrator) Shutdown() {
 	log.Println("\nshutting down...")
 
@@ -229,8 +245,10 @@ func (o *Orchestrator) Shutdown() {
 		// shutdown) on the floor.
 		for _, r := range o.runners {
 			close(r.mfaCancel)
-			r.gateway.Stop()
-			r.claimer.Stop()
+			if r.started {
+				r.gateway.Stop()
+				r.claimer.Stop()
+			}
 			for _, pool := range r.pools {
 				pool.StopRewarmer()
 				pool.Close()
