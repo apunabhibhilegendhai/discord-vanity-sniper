@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Fetch the active sniper config from Supabase and apply it atomically.
+#
+# The dashboard writes the active config row. Secret-at-rest encryption is
+# deferred; this script expects sniper_configs.config to be a JSON object that
+# matches the Go Conf schema.
+set -euo pipefail
+
+CONFIG_TABLE="${CONFIG_TABLE:-sniper_configs}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/discord-sniper/config.json}"
+STATE_DIR="${STATE_DIR:-/opt/discord-sniper/state}"
+STATE_FILE="$STATE_DIR/config.version"
+SUPABASE_URL="${SUPABASE_URL:?SUPABASE_URL is required}"
+SUPABASE_URL="${SUPABASE_URL%/}"
+SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SERVICE_ROLE_KEY:?SUPABASE_SERVICE_ROLE_KEY is required}"
+
+case "$CONFIG_TABLE" in
+  *[!A-Za-z0-9_]*|'')
+    echo "sniper-config-sync: invalid CONFIG_TABLE name" >&2
+    exit 1
+    ;;
+esac
+
+command -v curl >/dev/null 2>&1 || { echo "sniper-config-sync: curl is required" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "sniper-config-sync: jq is required" >&2; exit 1; }
+command -v sudo >/dev/null 2>&1 || { echo "sniper-config-sync: sudo is required" >&2; exit 1; }
+
+mkdir -p "$STATE_DIR"
+
+response="$(
+  curl -fsS --max-time 20 \
+    -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+    -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+    -H "Accept: application/json" \
+    "${SUPABASE_URL}/rest/v1/${CONFIG_TABLE}?select=version,config&active=eq.true&order=version.desc&limit=1"
+)"
+
+version="$(printf '%s' "$response" | jq -r '.[0].version // empty')"
+if [ -z "$version" ]; then
+  echo "sniper-config-sync: no active config row in ${CONFIG_TABLE}" >&2
+  exit 1
+fi
+
+if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "$version" ] && [ -f "$CONFIG_FILE" ]; then
+  exit 0
+fi
+
+tmp="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+printf '%s' "$response" | jq -e '.[0].config' >"$tmp"
+if ! jq -e 'type == "object"' "$tmp" >/dev/null; then
+  echo "sniper-config-sync: active config is not a JSON object" >&2
+  exit 1
+fi
+chmod 0600 "$tmp"
+mv "$tmp" "$CONFIG_FILE"
+trap - EXIT
+
+sudo -n /usr/local/sbin/sniper-restart
+printf '%s\n' "$version" >"$STATE_FILE"
+echo "sniper-config-sync: applied version ${version}"

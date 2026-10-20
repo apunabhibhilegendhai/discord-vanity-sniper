@@ -11,6 +11,11 @@
 # Output files
 sniper_*.txt
 
+# Local secrets
+.env
+.dev.vars
+deploy/env/*.env
+
 # Config (contains secrets)
 config.json
 
@@ -27,5 +32,14 @@ Thumbs.db
 *.swp
 *.swo
 
+# Dashboard build and local test data
+dashboard/node_modules/
+dashboard/.next/
+dashboard/.local/
+dashboard/.env*.local
+dashboard/*.tsbuildinfo
+
 # Go
 vendor/
+.freebuff/
+screenshots/

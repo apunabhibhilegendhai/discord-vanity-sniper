@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll for a new sniper config every 45 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=45s
+AccuracySec=5s
+Unit=sniper-config-sync.service
+
+[Install]
+WantedBy=timers.target

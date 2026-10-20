@@ -1,0 +1,25 @@
+[Unit]
+Description=Discord vanity sniper and Vanity Guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+WorkingDirectory=/opt/discord-sniper
+EnvironmentFile=/etc/discord-sniper/sniper.env
+ExecStartPre=/usr/bin/test -r /etc/discord-sniper/config.json
+ExecStart=/opt/discord-sniper/sniper -config /etc/discord-sniper/config.json
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/discord-sniper /opt/discord-sniper
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Publish Discord sniper health to Redis/Supabase
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+SupplementaryGroups=systemd-journal
+EnvironmentFile=/etc/discord-sniper/sniper.env
+ExecStart=/usr/local/lib/sniper/sniper-health
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

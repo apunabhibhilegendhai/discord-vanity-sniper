@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Publish sniper health without exposing internal process state.
+#
+# Redis receives a short-lived heartbeat. If HEALTH_TABLE is set, a durable
+# row is upserted to Supabase; the dashboard migration creates that table.
+set -euo pipefail
+
+UNIT="${SNIPER_UNIT:-discord-sniper.service}"
+INTERVAL="${HEALTH_INTERVAL:-30}"
+HEALTH_TABLE="${HEALTH_TABLE:-}"
+SUPABASE_URL="${SUPABASE_URL:-}"
+SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SERVICE_ROLE_KEY:-}"
+STATE_DIR="${STATE_DIR:-/opt/discord-sniper/state}"
+CONFIG_VERSION_FILE="${CONFIG_VERSION_FILE:-$STATE_DIR/config.version}"
+
+case "$HEALTH_TABLE" in
+  *[!A-Za-z0-9_]*)
+    echo "sniper-health: invalid HEALTH_TABLE name" >&2
+    exit 1
+    ;;
+esac
+
+if [ -n "$HEALTH_TABLE" ] && ! command -v jq >/dev/null 2>&1; then
+  echo "sniper-health: jq is required when HEALTH_TABLE is set" >&2
+  exit 1
+fi
+
+while true; do
+  heartbeat_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  status="$(systemctl is-active "$UNIT" 2>/dev/null || true)"
+  last_error="$(
+    journalctl -u "$UNIT" -n 100 --no-pager -o cat 2>/dev/null \
+      | grep -Ei 'error|panic|fatal' \
+      | tail -n 1 \
+      | cut -c1-500 \
+      || true
+  )"
+
+  # sniper-config-sync writes this only after a successful restart, so it is
+  # the durable record of the config version the running unit loaded. The Go
+  # process has no stats endpoint, and this pass does not add one.
+  applied_config_version="null"
+  if [ -r "$CONFIG_VERSION_FILE" ]; then
+    version="$(tr -d '[:space:]' <"$CONFIG_VERSION_FILE" 2>/dev/null || true)"
+    case "$version" in
+      ''|*[!0-9]*) ;;
+      *) applied_config_version="$version" ;;
+    esac
+  fi
+
+  if [ -n "${REDIS_URL:-}" ] && command -v redis-cli >/dev/null 2>&1; then
+    redis-cli -u "$REDIS_URL" SET sniper:heartbeat "$heartbeat_at" EX 90 >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "$HEALTH_TABLE" ] && [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_ROLE_KEY" ] && command -v curl >/dev/null 2>&1; then
+    body="$(
+      jq -cn \
+        --arg unit "$UNIT" \
+        --arg status "$status" \
+        --arg last_error "$last_error" \
+        --arg heartbeat_at "$heartbeat_at" \
+        --argjson applied_config_version "$applied_config_version" \
+        '{unit:$unit,status:$status,last_error:$last_error,heartbeat_at:$heartbeat_at,applied_config_version:$applied_config_version}'
+    )"
+    curl -fsS --max-time 10 \
+      -X POST "${SUPABASE_URL%/}/rest/v1/${HEALTH_TABLE}" \
+      -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+      -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+      -H "Content-Type: application/json" \
+      -H "Prefer: resolution=merge-duplicates,return=minimal" \
+      -d "$body" >/dev/null \
+      || echo "sniper-health: Supabase update failed" >&2
+  fi
+
+  sleep "$INTERVAL"
+done

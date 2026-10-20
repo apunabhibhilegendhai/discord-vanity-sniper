@@ -1,0 +1,17 @@
+[Unit]
+Description=Apply active sniper config from Supabase
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=sniper
+Group=sniper
+EnvironmentFile=/etc/discord-sniper/sniper.env
+ExecStart=/usr/local/lib/sniper/sniper-config-sync
+TimeoutStartSec=60
+
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/discord-sniper /opt/discord-sniper

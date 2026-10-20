@@ -1,0 +1,26 @@
+[Unit]
+Description=Discord sniper and Vanity Guard dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+WorkingDirectory=/opt/sniper-dashboard
+EnvironmentFile=/etc/sniper-dashboard/dashboard.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/npm start -- -H 127.0.0.1 -p 3000
+Restart=always
+RestartSec=5
+
+# NoNewPrivileges is intentionally omitted: the dashboard invokes the
+# fixed-unit sudo helper, and NoNewPrivileges would prevent that setuid
+# transition. The sudoers rule remains fixed-argument and fixed-unit.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sniper-dashboard
+
+[Install]
+WantedBy=multi-user.target

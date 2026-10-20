@@ -1,0 +1,22 @@
+[Unit]
+Description=Cloudflare Tunnel for the sniper dashboard
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/cloudflared/tunnel.env
+
+[Service]
+Type=simple
+User=cloudflared
+Group=cloudflared
+EnvironmentFile=/etc/cloudflared/tunnel.env
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

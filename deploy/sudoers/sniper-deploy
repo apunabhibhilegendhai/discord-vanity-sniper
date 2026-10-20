@@ -1,0 +1,19 @@
+# /etc/sudoers.d/sniper-deploy
+# Install root-owned with mode 0440 and validate with: visudo -cf <file>
+# The runner and the sniper services run as the `sniper` user.
+
+Defaults:sniper !requiretty
+
+# Config sync and the deploy workflow restart the fixed unit through this helper.
+sniper ALL=(root) NOPASSWD: /usr/local/sbin/sniper-restart
+
+# Deploy-sniper.yml stages files in /opt/discord-sniper, then installs them here.
+sniper ALL=(root) NOPASSWD: /usr/bin/install -d -m 0755 -o sniper -g sniper /opt/discord-sniper
+sniper ALL=(root) NOPASSWD: /usr/bin/install -m 0755 /opt/discord-sniper/sniper.new /opt/discord-sniper/sniper
+sniper ALL=(root) NOPASSWD: /usr/bin/install -m 0755 /opt/discord-sniper/sniper-restart /usr/local/sbin/sniper-restart
+sniper ALL=(root) NOPASSWD: /usr/bin/install -m 0644 /opt/discord-sniper/discord-sniper.service /etc/systemd/system/discord-sniper.service
+sniper ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
+
+# Deploy-dashboard.yml installs its unit and restarts the loopback service.
+sniper ALL=(root) NOPASSWD: /usr/bin/install -m 0644 /opt/sniper-dashboard/sniper-dashboard.service /etc/systemd/system/sniper-dashboard.service
+sniper ALL=(root) NOPASSWD: /usr/bin/systemctl restart sniper-dashboard.service

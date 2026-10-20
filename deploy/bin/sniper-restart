@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Restart exactly one known unit. Installed root-owned in /usr/local/sbin.
+set -euo pipefail
+
+UNIT="discord-sniper.service"
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "sniper-restart: must run as root" >&2
+  exit 1
+fi
+
+if ! systemctl cat "$UNIT" >/dev/null 2>&1; then
+  echo "sniper-restart: unit not installed: $UNIT" >&2
+  exit 1
+fi
+
+systemctl restart "$UNIT"
+systemctl is-active --quiet "$UNIT"

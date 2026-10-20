@@ -1,0 +1,60 @@
+name: Deploy sniper
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (for example v1.2.3)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sniper-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64, sniper-host]
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$VERSION" in
+            v[0-9]*) ;;
+            *) echo "::error::version must be a release tag such as v1.2.3"; exit 1 ;;
+          esac
+          mkdir -p ./artifact
+          gh release download "$VERSION" \
+            --pattern sniper-linux-amd64 --dir ./artifact
+
+      - name: Stage binary and helpers
+        run: |
+          sudo install -d -m 0755 -o sniper -g sniper /opt/discord-sniper
+          install -m 0755 ./artifact/sniper-linux-amd64 /opt/discord-sniper/sniper.new
+          install -m 0755 deploy/bin/sniper-restart /opt/discord-sniper/sniper-restart
+          install -m 0644 deploy/systemd/discord-sniper.service /opt/discord-sniper/discord-sniper.service
+
+      - name: Install helper and unit
+        run: |
+          sudo install -m 0755 /opt/discord-sniper/sniper-restart /usr/local/sbin/sniper-restart
+          sudo install -m 0644 /opt/discord-sniper/discord-sniper.service /etc/systemd/system/discord-sniper.service
+          sudo systemctl daemon-reload
+
+      - name: Install binary
+        run: |
+          sudo install -m 0755 /opt/discord-sniper/sniper.new /opt/discord-sniper/sniper
+
+      - name: Restart and verify
+        run: |
+          sudo /usr/local/sbin/sniper-restart
+          systemctl is-active --quiet discord-sniper.service
+          journalctl -u discord-sniper.service -n 30 --no-pager

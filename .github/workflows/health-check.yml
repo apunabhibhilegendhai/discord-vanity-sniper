@@ -1,0 +1,24 @@
+name: Public health probe
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe public Supabase
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://supabase.opendrive.indevs.in' }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          : "${SUPABASE_ANON_KEY:?missing SUPABASE_ANON_KEY}"
+          curl -fsS --max-time 15 \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            "${SUPABASE_URL}/auth/v1/settings" >/dev/null
