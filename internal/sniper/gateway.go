@@ -224,9 +224,15 @@ func (g *Gateway) Run() {
 
 		err := g.connect()
 		if err != nil {
-			// Dial failures are transient (network). Back off and retry.
+			// Dial failures are transient (network). Back off and retry. The
+			// sleep must be interruptible: Stop() closes g.done via a blocked
+			// Run, so a plain time.Sleep could stall shutdown up to 30s.
 			log.Printf("[gateway %s] connect error: %v", g.target.Vanity, err)
-			time.Sleep(retryDelay)
+			select {
+			case <-g.stop:
+				return
+			case <-time.After(retryDelay):
+			}
 			if retryDelay < maxRetryDelay {
 				retryDelay *= 2
 			}
@@ -322,6 +328,13 @@ func (g *Gateway) resume(sessionID string, seq int) error {
 }
 
 func (g *Gateway) listen() error {
+	// Capture the conn ONCE for this listen session. The reader goroutine must
+	// never read the g.conn field directly: Stop()/connect() replace or close
+	// it under g.mu, and an unsynchronized read from the reader goroutine is a
+	// data race on the field. connect() stored the dial result under the same
+	// mutex before listen() was called, so this value is the live conn.
+	conn := g.conn
+
 	// Read on a dedicated goroutine and pump messages into a channel. This lets
 	// the main loop select on g.stop and close g.conn to unblock the read when
 	// shutting down — otherwise ReadMessage blocks forever on a quiet conn and
@@ -333,7 +346,7 @@ func (g *Gateway) listen() error {
 	readCh := make(chan readResult, 1)
 
 	reader := func() {
-		_, msg, err := g.conn.ReadMessage()
+		_, msg, err := conn.ReadMessage()
 		select {
 		case readCh <- readResult{msg: msg, err: err}:
 		case <-g.stop:

@@ -25,6 +25,12 @@ type WebhookSender struct {
 	url   string
 	wg    sync.WaitGroup // tracks in-flight Sends for Flush
 
+	// sendMu serializes Sends. Warm-conn sharing means two concurrent Sends
+	// (claim success + guard quarantine can fire together) would interleave
+	// their HTTP request bytes on the same TLS conn and corrupt both frames;
+	// a mutex around the whole send keeps the pipelining sane.
+	sendMu sync.Mutex
+
 	mu       sync.Mutex
 	warmConn net.Conn // persistent TCP+TLS conn (nil = not yet dialed)
 	tlsConn  *tls.Conn
@@ -49,7 +55,9 @@ func (w *WebhookSender) Send(title string, color int, fields map[string]string) 
 		return
 	}
 	w.wg.Add(1)
+	w.sendMu.Lock()
 	w.send(title, color, fields)
+	w.sendMu.Unlock()
 	w.wg.Done()
 }
 
@@ -130,26 +138,38 @@ func (w *WebhookSender) send(title string, color int, fields map[string]string) 
 
 		// Read the response to confirm delivery. Discord returns 204 No Content
 		// on success; anything else (429, 404, 500, Cloudflare block) means the
-		// embed was NOT delivered.
+		// embed was NOT delivered. Read until the response is complete — a
+		// single Read can return a header fragment that spans TCP segments.
 		writeConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		respBuf := make([]byte, 1024)
-		n, rerr := writeConn.Read(respBuf)
+		resp, complete := readHTTPResponse(writeConn, 64*1024)
 
-		// On read error, the warm conn is likely stale — close it so the next
-		// attempt dials fresh.
-		if rerr != nil && n == 0 {
-			log.Printf("[webhook] read error (attempt %d/%d): %v", attempt+1, maxRetries, rerr)
+		statusLine := extractStatusLine(resp)
+		statusCode := parseStatusCode(resp)
+
+		if len(resp) == 0 {
+			// No bytes: the warm conn is likely stale — close it so the next
+			// attempt dials fresh.
+			log.Printf("[webhook] read error (attempt %d/%d)", attempt+1, maxRetries)
 			w.closeConn()
 			continue
 		}
 
-		resp := respBuf[:n]
-		statusLine := extractStatusLine(resp)
-		statusCode := parseStatusCode(resp)
-
-		if statusCode == 204 || (statusCode >= 200 && statusCode < 300) {
-			// Success — keep the warm conn alive for the next Send.
+		// A 2xx status is authoritative for delivery: webhook POSTs carry no
+		// meaningful body, and retrying a fragmented-but-successful response
+		// would double-post the embed. Only non-2xx or statusless responses
+		// retry.
+		if statusCode >= 200 && statusCode < 300 {
+			// Success.
+			if !complete {
+				log.Printf("[webhook] %s arrived incomplete; treating as delivered", statusLine)
+				w.closeConn() // conn state unknown — next Send dials fresh
+			}
 			return
+		}
+
+		if !complete {
+			log.Printf("[webhook] incomplete response (attempt %d/%d) — %s",
+				attempt+1, maxRetries, statusLine)
 		}
 
 		// Non-success: log and retry. Extract body for diagnosis.
@@ -253,6 +273,44 @@ func (w *WebhookSender) closeConn() {
 		w.tlsConn = nil
 	}
 	w.mu.Unlock()
+}
+
+// readHTTPResponse reads one HTTP/1.1 response from conn until it is complete:
+// Content-Length body fully received, a chunked terminator, or a response with
+// no framing headers (header block is everything we can rely on). Returns
+// complete=false on a deadline, EOF, or an oversized response.
+func readHTTPResponse(conn net.Conn, maxBytes int) ([]byte, bool) {
+	var resp []byte
+	buf := make([]byte, 4096)
+	bodyLen := -1
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			resp = append(resp, buf[:n]...)
+		}
+		headerEnd := bytes.Index(resp, []byte("\r\n\r\n"))
+		if headerEnd >= 0 {
+			if bodyLen < 0 {
+				bodyLen = contentLength(resp)
+			}
+			isChunked := bytes.Contains(resp[:headerEnd], []byte("Transfer-Encoding: chunked")) ||
+				bytes.Contains(resp[:headerEnd], []byte("transfer-encoding: chunked"))
+			if isChunked {
+				if bytes.Contains(resp[headerEnd+4:], []byte("\r\n0\r\n")) {
+					return resp, true
+				}
+			} else if bodyLen >= 0 {
+				if len(resp) >= headerEnd+4+bodyLen {
+					return resp, true
+				}
+			} else {
+				return resp, true
+			}
+		}
+		if err != nil || len(resp) > maxBytes {
+			return resp, false
+		}
+	}
 }
 
 // parseWebhookURL splits a Discord webhook URL into host, request path, and
