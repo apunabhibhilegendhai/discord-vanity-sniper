@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -82,49 +83,56 @@ func TestManualMFAClaimPath(t *testing.T) {
 	ResolveFingerprint(cfg)
 	sp, ua := cfg.Fingerprint.SuperPropsB64, cfg.Fingerprint.UserAgent
 
+	// Optional build-number probe (MFA_TEST_BUILD, optionally MFA_TEST_CHROME
+	// like "150.0.0.0"). Discord answers
+	// `You need to update your app to perform this action.` for requests with
+	// a stale client_build_number; the override lets us hunt the current one.
+	if b := envOr("MFA_TEST_BUILD", ""); b != "" {
+		n, _ := strconv.Atoi(b)
+		ver := envOr("MFA_TEST_CHROME", "150.0.0.0")
+		sp = buildChromeSuperPropsVersioned(n, ver)
+		ua = fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", ver)
+		t.Logf("probing with client_build_number=%d (Chrome %s)", n, ver)
+	}
+
+	// MFA_TEST_PROBE_ONLY=1: run just the username self-set probe and report
+	// the verdict, skipping the guild ladder and the solve.
+	probeOnly := envOr("MFA_TEST_PROBE_ONLY", "") == "1"
+
 	// Step 1: the pasted token must be live.
 	if !ValidateToken(token, sp, ua, "") {
 		t.Fatal("supplied token failed GET /users/@me — invalid or expired")
 	}
 	t.Logf("token live ✅ (%s)", maskToken(token))
 
-	// Step 2: pick a SAFE ticket trigger, in a no-damage ladder:
-	//   Path A — a guild the account owns that ALREADY carries a vanity. The
-	//   probe re-PATCHes the EXACT current code, so even a granted
-	//   (challenge-free) request is an exact no-op on a real server.
-	//   Path B — no such guild exists, or PATCH answers without a challenge:
-	//   create a throwaway guild (nothing snipable on it) and delete it in
-	//   cleanup.
-	gid, targetCode, throwaway := pickTicketTrigger(t, token, ua, sp)
-	if throwaway {
-		t.Cleanup(func() {
-			resp := sendLoginRequest(buildGuildDelete(token, gid, ua))
-			t.Logf("cleanup: DELETE guild %s -> %s", maskID(gid), extractStatusLine(resp))
-		})
+	// Step 2: capture a ticket with the no-damage trigger ladder, most benign
+	// first:
+	//   Path 0 — PATCH /users/@me re-setting the CURRENT username: an exact
+	//   no-op if granted, a standard 60003 MFA challenge (ticket) otherwise.
+	//   No guild is involved anywhere.
+	//   Path A — a guild where the token holds MANAGE_GUILD with an existing
+	//   vanity; the probe re-sends the EXACT current code (guaranteed no-op).
+	//   Path B — fallback: a throwaway guild created and deleted by the probe.
+	ticket, source := captureTicket(t, token, ua, sp)
+	if probeOnly {
+		if ticket == "" {
+			t.Skip("username probe: no ticket (see logs above) — probe-only mode stops here")
+		}
+		t.Logf("username probe: TICKET captured, would proceed to solve — probe-only mode stops here")
+		t.Skip("ticket working; re-run without MFA_TEST_PROBE_ONLY to solve")
 	}
+	if ticket == "" {
+		t.Fatal("no MFA challenge could be interposed by any no-damage trigger")
+	}
+	t.Logf("ticket captured via %s (%s, %d chars)", source, maskID(ticket), len(ticket))
 
-	// Step 3: ticket capture against the chosen trigger. A 60003 challenge
-	// response is EXPECTED and fully benign (the request is rejected pending
-	// MFA — nothing on the guild changes).
+	// Step 3: TOTP solve → MFA JWT. THE decisive assertion: if this fails
+	// with 60008, MFA_TEST_TOTP does not match the account's enrolled key.
 	m := NewMFAHandler(&Target{
-		GuildID: gid,
-		Vanity:  targetCode,
-		Token:   token,
+		Vanity: fmt.Sprintf("probe:%s", source),
+		Token:  token,
 	}, NewSessionStore(""), "", totpSecret, nil, &cfg.Fingerprint)
 
-	ticketStart := time.Now()
-	ticket, err := m.getTicket()
-	if err != nil {
-		t.Fatalf("getTicket: %v", err)
-	}
-	if len(ticket) > 8 {
-		ticket = ticket[:8]
-	}
-	t.Logf("ticket captured in %s (%s…, %d chars)",
-		time.Since(ticketStart).Round(time.Millisecond), maskID(ticket), len(ticket))
-
-	// Step 4: TOTP solve → MFA JWT. THE decisive assertion: if this fails
-	// with 60008, MFA_TEST_TOTP does not match the account's enrolled key.
 	solveStart := time.Now()
 	jwt, expiresIn, err := m.solveTOTP(ticket)
 	if err != nil {
@@ -135,8 +143,9 @@ func TestManualMFAClaimPath(t *testing.T) {
 	}
 	t.Logf("MFA JWT solved in %s — valid ~%ds (%s)",
 		time.Since(solveStart).Round(time.Millisecond), expiresIn, maskID(jwt))
+	m.SetToken(jwt, expiresIn)
 
-	// Step 5: the exact header the claim burst splices into the PATCH.
+	// Step 4: the exact header the claim burst splices into the PATCH.
 	name, val := m.GetHeader()
 	if name == "" || val == "" {
 		t.Fatal("GetHeader returned an empty MFA header after a successful solve")
@@ -146,45 +155,82 @@ func TestManualMFAClaimPath(t *testing.T) {
 
 // guildLite / vanityResp parse just the fields the trigger ladder needs.
 type guildLite struct {
-	ID    string `json:"id"`
-	Owner bool   `json:"owner"`
+	ID          string `json:"id"`
+	Owner       bool   `json:"owner"`
+	Permissions string `json:"permissions"` // decimal bitset string
+}
+
+// hasManageGuild reports the MANAGE_GUILD (1<<5 = 0x20) bit of the token's
+// permissions in a guild, per the /users/@me/guilds list.
+func (g guildLite) hasManageGuild() bool {
+	if g.Owner {
+		return true
+	}
+	perms, err := strconv.ParseInt(g.Permissions, 10, 64)
+	if err != nil {
+		return false
+	}
+	return perms&0x20 != 0
 }
 
 type vanityResp struct {
 	Code *string `json:"code"`
 }
 
-// pickTicketTrigger resolves (guild id, vanity code) for the MFA ticket PATCH
-// and reports whether that guild is a throwaway (delete-on-cleanup).
+// captureTicket interposes an MFA challenge (60003 ticket) using the most
+// benign, guaranteed-no-op trigger available, and returns the ticket + label.
 //
-// Path A (real guild): owned guild that already has a vanity; the PATCH
-// re-sends that exact code, so any granted request is an identity no-op. This
-// never creates or deletes anything on the account.
+// Path 0 (username self-set): PATCH /users/@me with the exact current
+// username. If granted, Discord accepts the no-change write; if challenged,
+// the request is rejected pending MFA with a ticket. The account state is
+// identical after either answer.
 //
-// Path B (throwaway): no owned+vanity guild exists, or the same-code PATCH was
-// granted without a challenge — a fresh guild is created purely as the probe
-// scope and removed by the returned cleanup.
-func pickTicketTrigger(t *testing.T, token, ua, sp string) (gid string, code string, throwaway bool) {
+// Path A (same-code vanity re-set): a guild where the token holds
+// MANAGE_GUILD with an existing vanity; the probe re-sends that exact code.
+//
+// Path B (throwaway): a fresh guild created purely as the probe scope and
+// deleted on cleanup.
+func captureTicket(t *testing.T, token, ua, sp string) (string, string) {
+	// Path 0.
+	ub := sendLoginRequest(rawGuildReq("GET", "/api/v9/users/@me", token, "", ua, sp))
+	username := extractJSONStringField(string(extractRawBody(ub)), "username")
+	if username != "" {
+		probe := sendLoginRequest(rawGuildReq("PATCH", "/api/v9/users/@me", token,
+			fmt.Sprintf(`{"username":"%s"}`, username), ua, sp))
+		if ticket, err := extractTicket(probe); err == nil {
+			t.Logf("trigger: same-username self-set interposed the challenge (%s)", extractStatusLine(probe))
+			return ticket, "username-self-set"
+		}
+		status := parseStatusCode(probe)
+		if status/100 == 2 {
+			t.Logf("username self-set granted challenge-free (%s) — falling to the guild ladder", extractStatusLine(probe))
+		} else if strings.Contains(string(respBody(probe)), "captcha") {
+			t.Logf("username probe captcha'd (build gate?): %s — %s",
+				extractStatusLine(probe), string(extractBody(probe)))
+		} else {
+			t.Logf("username self-set answered without a ticket: %s (%s)", extractStatusLine(probe), extractBody(probe))
+		}
+	}
+
 	// Path A.
 	resp := sendLoginRequest(rawGuildReq("GET", "/api/v9/users/@me/guilds", token, "", ua, sp))
 	var guilds []guildLite
 	if err := json.Unmarshal([]byte(extractRawBody(resp)), &guilds); err == nil {
 		for _, g := range guilds {
-			if !g.Owner || g.ID == "" {
+			if g.ID == "" || !g.hasManageGuild() {
 				continue
 			}
 			vresp := sendLoginRequest(rawGuildReq("GET", "/api/v9/guilds/"+g.ID+"/vanity-url", token, "", ua, sp))
 			var vr vanityResp
 			if json.Unmarshal([]byte(extractRawBody(vresp)), &vr) == nil && vr.Code != nil && *vr.Code != "" {
-				// Confirm the PATCH actually interposes an MFA challenge; a
-				// granted same-code request (recent-solve grace) cannot act
-				// as a ticket trigger.
 				probe := sendLoginRequest(rawGuildReqPatchVanity(g.ID, *vr.Code, token, ua, sp))
-				if parseStatusCode(probe)/100 != 2 && strings.Contains(string(respBody(probe)), "ticket") {
-					t.Logf("trigger: owned guild %s (vanity re-set of its current code — a guaranteed no-op)", maskID(g.ID))
-					return g.ID, *vr.Code, false
+				if ticket, err := extractTicket(probe); err == nil {
+					t.Logf("trigger: guild %s (its current vanity re-set — a guaranteed no-op)", maskID(g.ID))
+					return ticket, "guild-same-code"
 				}
-				t.Logf("guild %s PATCH did not interpose a challenge (%s) — trying the next guild", maskID(g.ID), extractStatusLine(probe))
+				t.Logf("guild %s PATCH gave no ticket (%s) — trying the next guild", maskID(g.ID), extractStatusLine(probe))
+			} else {
+				t.Logf("guild %s: no existing vanity (skipping — a granted PATCH would set one)", maskID(g.ID))
 			}
 		}
 	} else {
@@ -192,8 +238,25 @@ func pickTicketTrigger(t *testing.T, token, ua, sp string) (gid string, code str
 	}
 
 	// Path B.
+	ticket, source := throwawayTicket(t, token, ua, sp)
+	return ticket, source
+}
+
+// throwawayTicket creates the probe guild, PATCHes an invisible-of-consequence
+// vanity at it, extracts the ticket, and registers the guild's DELETE as
+// cleanup. Nothing snipable ever exists on the throwaway.
+func throwawayTicket(t *testing.T, token, ua, sp string) (string, string) {
 	tgid := createThrowawayTrigger(t, token, ua, sp)
-	return tgid, "zsnp0mfa", true
+	t.Cleanup(func() {
+		resp := sendLoginRequest(buildGuildDelete(token, tgid, ua))
+		t.Logf("cleanup: DELETE guild %s -> %s", maskID(tgid), extractStatusLine(resp))
+	})
+	probe := sendLoginRequest(rawGuildReqPatchVanity(tgid, "zsnp0mfa", token, ua, sp))
+	ticket, err := extractTicket(probe)
+	if err != nil {
+		t.Fatalf("throwaway PATCH gave no ticket: %s (%s)", extractStatusLine(probe), extractBody(probe))
+	}
+	return ticket, fmt.Sprintf("throwaway:%s", maskID(tgid))
 }
 
 // createThrowawayTrigger POSTs a minimal guild owned by the probed account so
@@ -212,10 +275,15 @@ func createThrowawayTrigger(t *testing.T, token, ua, sp string) string {
 	return gid
 }
 
-// rawGuildReq builds a JSON request to discord.com with a browser-credible
-// header set. The set mirrors minimal browser traffic: X-Super-Properties,
-// origin context, Sec-Fetch-*, Accept-Language — the bare header set (api-raw
-// style) gets treated as scripted traffic on some endpoints.
+// rawGuildReq builds a JSON request to discord.com with the PROVEN MINIMAL
+// header set (the one that works for the claim PATCH in production):
+// request-line, Host, Authorization, Content-* , X-Super-Properties, UA.
+//
+// Deliberately EXCLUDING browser-like headers (Origin, Referer, Sec-Fetch-*,
+// X-Context-Properties): this repo's own claims history found they TRIGGER the
+// 403/10008 "Unknown Message" rather than prevent it — a raw TLS socket that
+// claims to be a browser page load is more suspicious than one that openly
+// speaks the API dialect (ValidateToken's bare GET /users/@me also passes).
 func rawGuildReq(method, path, token, body, ua, sp string) string {
 	sb := new(strings.Builder)
 	fmt.Fprintf(sb, "%s %s HTTP/1.1\r\n", method, path)
@@ -233,15 +301,7 @@ func rawGuildReq(method, path, token, body, ua, sp string) string {
 	if ua != "" {
 		fmt.Fprintf(sb, "User-Agent: %s\r\n", ua)
 	}
-	sb.WriteString("X-Discord-Locale: en-US\r\n")
-	sb.WriteString("X-Context-Properties: eyJsb2NhdGlvbiI6IkdpbGQgU2V0dGluZ3MifQ==\r\n") // {"location":"Guild Settings"}
-	sb.WriteString("Origin: https://discord.com\r\n")
-	sb.WriteString("Referer: https://discord.com/channels/@me\r\n")
 	sb.WriteString("Accept: */*\r\n")
-	sb.WriteString("Accept-Language: en-US,en;q=0.9\r\n")
-	sb.WriteString("Sec-Fetch-Site: same-origin\r\n")
-	sb.WriteString("Sec-Fetch-Mode: cors\r\n")
-	sb.WriteString("Sec-Fetch-Dest: empty\r\n")
 	sb.WriteString("Connection: close\r\n\r\n")
 	sb.WriteString(body)
 	return sb.String()

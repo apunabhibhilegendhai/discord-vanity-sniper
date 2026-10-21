@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"strings"
 
 	utls "github.com/refraction-networking/utls"
@@ -126,17 +128,25 @@ func ResolveFingerprint(cfg *Conf) *BrowserProfile {
 }
 
 // buildChromeSuperProps generates a base64-encoded X-Super-Properties JSON
-// matching a real Chrome Discord client: Windows, Chrome 143.0.0.0,
-// client_build_number 565311, has_client_mods: false, with referrer fields
-// (referrer, referring_domain, search_engine) set to plausible values.
+// matching a real Chrome Discord client on Windows at the CURRENT stable
+// build. client_build_number goes stale every few weeks — Discord's
+// captcha-bearing sensitive endpoints answer
+// `You need to update your app to perform this action.` for stale builds.
+// bumpChromeBuild() below is the one-line update point.
 func buildChromeSuperProps() string {
+	return buildChromeSuperPropsVersioned(currentChromeBuild(), currentChromeVersion())
+}
+
+// buildChromeSuperPropsVersioned is the parametric builder; tests and build
+// bumping override the build number / browser version.
+func buildChromeSuperPropsVersioned(build int, chromeVer string) string {
 	props := map[string]interface{}{
 		"os":                       "Windows",
 		"browser":                  "Chrome",
 		"device":                   "",
 		"system_locale":            "en-US",
-		"browser_user_agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-		"browser_version":          "143.0.0.0",
+		"browser_user_agent":       fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", chromeVer),
+		"browser_version":          chromeVer,
 		"os_version":               "10",
 		"referrer":                 "https://www.google.com/",
 		"referring_domain":         "www.google.com",
@@ -144,11 +154,34 @@ func buildChromeSuperProps() string {
 		"referrer_current":         "",
 		"referring_domain_current": "",
 		"release_channel":          "stable",
-		"client_build_number":      565311,
+		"client_build_number":      build,
 		"client_event_source":      nil,
 		"has_client_mods":          false,
 	}
 	return base64Props(props)
+}
+
+// Buildable overrides used by the manual probe and bump tooling.
+var chromeBuildOverride = os.Getenv("SNIPER_CHROME_BUILD")
+var chromeVersionOverride = os.Getenv("SNIPER_CHROME_VERSION")
+
+// currentChromeBuild / currentChromeVersion resolve the active build number
+// and browser version, honoring SNIPER_CHROME_BUILD / SNIPER_CHROME_VERSION
+// overrides so a stale preset can be hot-patched by config alone.
+func currentChromeBuild() int {
+	if chromeBuildOverride != "" {
+		if n, err := strconv.Atoi(chromeBuildOverride); err == nil {
+			return n
+		}
+	}
+	return 565311 // last verified-good build; see bumpChromeBuild note above
+}
+
+func currentChromeVersion() string {
+	if chromeVersionOverride != "" {
+		return chromeVersionOverride
+	}
+	return "143.0.0.0"
 }
 
 // buildFirefoxSuperProps generates a base64-encoded X-Super-Properties JSON
