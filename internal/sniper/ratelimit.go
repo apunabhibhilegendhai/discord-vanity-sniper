@@ -145,6 +145,10 @@ func (r *RateLimiter) HandleResponse(key string, headers []string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// Two passes: X-RateLimit-Global's fallback window needs the Retry-After
+	// value, and Discord sends them in arbitrary order — a single pass would
+	// take the conservative default whenever Retry-After comes later.
+
 	for _, h := range headers {
 		parts := strings.SplitN(h, ":", 2)
 		if len(parts) != 2 {
@@ -153,44 +157,57 @@ func (r *RateLimiter) HandleResponse(key string, headers []string) {
 		name := strings.TrimSpace(parts[0])
 		val := strings.TrimSpace(parts[1])
 
-		switch name {
-		case "X-RateLimit-Limit":
+		switch {
+		case strings.EqualFold(name, "X-RateLimit-Limit"):
 			if v, err := strconv.Atoi(val); err == nil {
 				b.limit = v
 			}
-		case "X-RateLimit-Remaining":
+		case strings.EqualFold(name, "X-RateLimit-Remaining"):
 			if v, err := strconv.Atoi(val); err == nil {
 				b.remaining = v
 			}
-		case "X-RateLimit-Reset":
+		case strings.EqualFold(name, "X-RateLimit-Reset"):
 			// Discord sends this as a Unix timestamp in SECONDS (may be fractional).
 			if v, err := strconv.ParseFloat(val, 64); err == nil {
 				secs := int64(v)
 				nanos := int64((v - float64(secs)) * 1e9)
 				b.resetAt = time.Unix(secs, nanos)
 			}
-		case "X-RateLimit-Scope":
+		case strings.EqualFold(name, "X-RateLimit-Scope"):
 			b.scope = val
-		case "Retry-After":
-			// Retry-After is in SECONDS per RFC 7231 / Discord convention.
-			// (Previously this used Millisecond, which was 1000× too short.)
-			if v, err := strconv.Atoi(val); err == nil {
-				wait := time.Duration(v) * time.Second
-				b.backoff = time.Now().Add(wait)
-				b.lastRetryAfter = val
-			}
-		case "X-RateLimit-Global":
-			if val == "true" {
-				// Honor Retry-After for the global window when present; fall back
-				// to a conservative 10s default.
-				wait := 10 * time.Second
-				if v, err := strconv.Atoi(b.lastRetryAfter); err == nil && v > 0 {
-					wait = time.Duration(v) * time.Second
+		case strings.EqualFold(name, "Retry-After"):
+			// Discord sends fractional seconds (e.g. "0.342"); parse as float.
+			// (An older version used Millisecond here — 1000× too short.)
+			if v, err := strconv.ParseFloat(val, 64); err == nil {
+				if v < 0 {
+					v = 0
 				}
-				r.mu.Lock()
-				r.globalUntil = time.Now().Add(wait)
-				r.mu.Unlock()
+				b.lastRetryAfter = val
+				wait := time.Duration(v * float64(time.Second))
+				b.backoff = time.Now().Add(wait)
 			}
+		}
+	}
+
+	// Second pass for the global window so it can consult Retry-After.
+	for _, h := range headers {
+		parts := strings.SplitN(h, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+
+		if strings.EqualFold(name, "X-RateLimit-Global") && val == "true" {
+			// Honor Retry-After for the global window when present; fall back
+			// to a conservative 10s default.
+			wait := 10 * time.Second
+			if v, err := strconv.ParseFloat(b.lastRetryAfter, 64); err == nil && v > 0 {
+				wait = time.Duration(v * float64(time.Second))
+			}
+			r.mu.Lock()
+			r.globalUntil = time.Now().Add(wait)
+			r.mu.Unlock()
 		}
 	}
 }
