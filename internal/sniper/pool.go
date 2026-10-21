@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"strconv"
@@ -115,9 +116,21 @@ func (p *ConnPool) rewarmer() {
 		case <-p.stopCh:
 			return
 		case <-ticker.C:
-			p.fillOnce()
+			p.safeFillOnce()
 		}
 	}
+}
+
+// safeFillOnce contains a panic in the background refill loop. The rewarmer
+// runs for the whole session; a panic reaching its root would end an
+// unattended Actions-hosted session over a bookkeeping slip.
+func (p *ConnPool) safeFillOnce() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[pool %s] recovered from panic in rewarmer: %v", proxyLabel(p.proxy), r)
+		}
+	}()
+	p.fillOnce()
 }
 
 // fillOnce tops the pool up to target with at most one dial per tick. Dialing

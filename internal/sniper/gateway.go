@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -444,7 +445,7 @@ func (g *Gateway) listen() error {
 
 			switch packet.Op {
 			case 0: // Dispatch
-				g.handleDispatch(packet.Type, packet.Data, frameT0)
+				g.safeDispatch(packet.Type, packet.Data, frameT0)
 
 			case 7: // Reconnect
 				g.conn.Close()
@@ -701,6 +702,24 @@ func jsonObjectValueEnds(data []byte, i int) bool {
 		i++
 	}
 	return i < len(data) && (data[i] == ',' || data[i] == '}')
+}
+
+// safeDispatch contains panics from the decode/dispatch path inside the listen
+// loop. handleDispatch parses attacker-adjacent JSON pushed by Discord's
+// gateway; an unexpected payload shape must cost one log line and one dropped
+// event, not the whole 6-hour Actions-hosted session (a panic reaching the
+// gateway goroutine's root kills the process).
+func (g *Gateway) safeDispatch(t string, data json.RawMessage, frameT0 time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[gateway %s] recovered from panic in dispatch %s: %v\n%s",
+				g.target.currentVanity(), t, r, debug.Stack())
+			if g.stats != nil {
+				g.stats.AddError()
+			}
+		}
+	}()
+	g.handleDispatch(t, data, frameT0)
 }
 
 func (g *Gateway) handleDispatch(t string, data json.RawMessage, frameT0 time.Time) {

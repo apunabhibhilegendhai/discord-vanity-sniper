@@ -3,6 +3,7 @@ package sniper
 import (
 	"fmt"
 	"log"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -423,7 +424,21 @@ func (o *Orchestrator) Run() {
 }
 
 func (o *Orchestrator) dashboard() {
-	ticker := time.NewTicker(5 * time.Second)
+	// On an interactive terminal the stats line repaints a single in-place
+	// line (\r) every 5s. On redirected output — Actions log streams, files,
+	// pipes — \r has no cursor semantics: each repaint renders as a new line,
+	// which would flood a 5h45m session's logs with ~4,100 near-identical
+	// entries. Non-TTY output logs a compact checkpoint every 5 minutes
+	// instead.
+	isTTY := stdoutIsTTY()
+	period := 5 * time.Second
+	repaint := "\r[stats] %s   "
+	if !isTTY {
+		period = 5 * time.Minute
+		repaint = "[stats] %s\n"
+	}
+
+	ticker := time.NewTicker(period)
 	defer ticker.Stop()
 
 	for {
@@ -443,9 +458,20 @@ func (o *Orchestrator) dashboard() {
 				p99.dispatch.Seconds()*1000, p99.local.Seconds()*1000, p99.rtt.Seconds()*1000, p99.total.Seconds()*1000)
 		}
 
-		fmt.Printf("\r[stats] checks: %d | claims: %d | errors: %d | speed: %.1f/s | uptime: %s%s   ",
+		body := fmt.Sprintf("checks: %d | claims: %d | errors: %d | speed: %.1f/s | uptime: %s%s",
 			checks, claims, errors, cps, elapsed.Round(time.Second), latLine)
+		fmt.Printf(repaint, body)
 	}
+}
+
+// stdoutIsTTY reports whether stdout is an interactive terminal. Files and
+// pipes (including CI log capture) are char-device-less → false.
+func stdoutIsTTY() bool {
+	st, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return st.Mode()&os.ModeCharDevice != 0
 }
 
 // warmPoolsParallel builds one warm ConnPool per proxy entry concurrently,
