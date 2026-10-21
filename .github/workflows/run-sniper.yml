@@ -1,0 +1,123 @@
+name: Run sniper (Actions-hosted)
+
+# GitHub Actions cannot host a 24/7 daemon: a GitHub-hosted job is capped at
+# 6 hours and its VM is destroyed at the end. This workflow therefore runs a
+# bounded session and dispatches its own successor before exiting, so the
+# sniper keeps running as a chain of sessions instead of one long process.
+#
+# That chain is not equivalent to systemd on an always-on host:
+#   - every session is a fresh VM, so warm TLS pools and the gateway sequence
+#     are rebuilt from scratch;
+#   - there is a gap between sessions while the new job queues and arms;
+#   - two runs never overlap (concurrency group), but a queued run can be
+#     delayed under load.
+# For a true always-on sniper use deploy-sniper.yml on a `sniper-host` runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Minutes to run before chaining the next session (max 350)"
+        required: false
+        default: "345"
+  schedule:
+    # Watchdog: starts a session every 6 hours if the chain ever breaks.
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  # One session at a time. The successor is dispatched just before this job
+  # exits, so it waits here instead of racing the running sniper.
+  group: sniper-session
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: write # required to dispatch the next session
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build sniper
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ./sniper .
+          ./sniper -h >/dev/null 2>&1 || true
+          ls -l ./sniper
+
+      - name: Materialize config
+        env:
+          SNIPER_CONFIG_JSON: ${{ secrets.SNIPER_CONFIG_JSON }}
+        run: |
+          if [ -z "${SNIPER_CONFIG_JSON}" ]; then
+            echo "::error::SNIPER_CONFIG_JSON is not set. Add the full config.json contents as a repository secret (Settings -> Secrets and variables -> Actions). The file must match the Go Conf schema and is never committed."
+            exit 1
+          fi
+          printf '%s' "${SNIPER_CONFIG_JSON}" > config.json
+          chmod 0600 config.json
+          if ! jq -e 'type == "object" and has("targets") and (.targets | type == "array") and (.targets | length > 0)' config.json >/dev/null; then
+            echo "::error::SNIPER_CONFIG_JSON must be a JSON object with a non-empty targets array."
+            exit 1
+          fi
+          # Never echo secrets. Only non-secret shape is logged.
+          echo "config ok: $(jq -r '.targets | length' config.json) target(s), burst_count=$(jq -r '.burst_count // 5' config.json), guard_mode=$(jq -r '.guard_mode // false' config.json)"
+
+      - name: Run session
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes || '345' }}
+        run: |
+          case "${SESSION_MINUTES}" in
+            ''|*[!0-9]*) echo "::error::session_minutes must be an integer"; exit 1 ;;
+          esac
+          if [ "${SESSION_MINUTES}" -gt 350 ]; then
+            echo "session_minutes capped to 350 (job limit is 360)"
+            SESSION_MINUTES=350
+          fi
+          seconds=$(( SESSION_MINUTES * 60 ))
+          echo "running for ${SESSION_MINUTES}m (${seconds}s)"
+          set +e
+          # SIGINT drives the sniper's own signal handler, which stops claimers,
+          # flushes sessions, sends the shutdown webhook and exits cleanly.
+          timeout --signal=INT --kill-after=90s "${seconds}s" ./sniper -config config.json
+          rc=$?
+          set -e
+          if [ "${rc}" -eq 124 ]; then
+            echo "::notice::session window ended after ${SESSION_MINUTES}m; chaining the next session"
+            echo "SESSION_ENDED=1" >> "${GITHUB_ENV}"
+            exit 0
+          fi
+          echo "::error::sniper exited unexpectedly with status ${rc}"
+          exit "${rc}"
+
+      - name: Session summary
+        if: always()
+        run: |
+          {
+            echo "### Sniper session"
+            echo ""
+            echo "- runner: ${RUNNER_NAME}"
+            echo "- duration window: ${{ inputs.session_minutes || '345' }}m"
+            echo "- host: GitHub-hosted (ephemeral VM)"
+            echo ""
+            echo "This is a chained session, not an always-on host. Expect a gap"
+            echo "between sessions and a cold warm-pool/gateway on every start."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Chain next session
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh workflow run run-sniper.yml --repo "${GH_REPO}" --ref "${GITHUB_REF_NAME}" \
+            -f session_minutes=345
+          echo "dispatched the next session"
