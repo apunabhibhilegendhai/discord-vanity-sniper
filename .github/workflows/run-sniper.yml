@@ -56,20 +56,54 @@ jobs:
 
       - name: Materialize config
         env:
+          # Preferred: the complete config document, used verbatim so proxies,
+          # guard settings and burst tuning survive. Falls back to the same
+          # per-secret shape the old live-test workflow used.
           SNIPER_CONFIG_JSON: ${{ secrets.SNIPER_CONFIG_JSON }}
+          GUILD_ID: ${{ secrets.GUILD_ID }}
+          VANITY: ${{ secrets.VANITY }}
+          TOKEN: ${{ secrets.TOKEN }}
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          if [ -z "${SNIPER_CONFIG_JSON}" ]; then
-            echo "::error::SNIPER_CONFIG_JSON is not set. Add the full config.json contents as a repository secret (Settings -> Secrets and variables -> Actions). The file must match the Go Conf schema and is never committed."
+          umask 077
+          if [ -n "${SNIPER_CONFIG_JSON}" ]; then
+            printf '%s' "${SNIPER_CONFIG_JSON}" > config.json
+            source="SNIPER_CONFIG_JSON"
+          elif [ -n "${GUILD_ID}" ] && [ -n "${VANITY}" ] && \
+               { [ -n "${TOKEN}" ] || { [ -n "${EMAIL}" ] && [ -n "${PASSWORD}" ]; }; }; then
+            # jq -n keeps values out of the document text, so a password
+            # containing quotes or backslashes cannot corrupt the JSON.
+            jq -n \
+              --arg webhook "${WEBHOOK_URL}" \
+              --arg totp "${TOTP_SECRET}" \
+              --arg password "${PASSWORD}" \
+              --arg email "${EMAIL}" \
+              --arg guild "${GUILD_ID}" \
+              --arg vanity "${VANITY}" \
+              --arg token "${TOKEN}" \
+              '{webhook_url:$webhook, totp_secret:$totp, password:$password,
+                email:$email, backup_codes:[], burst_count:1,
+                warm_connections:1, session_path:"session_state.json",
+                guard_mode:false,
+                targets:[{guild_id:$guild, vanity:$vanity, token:$token,
+                          password:$password, proxies:[""]}],
+                browser:"firefox"}' > config.json
+            source="repository secrets"
+          else
+            echo "::error::No sniper credentials. Add repository secrets: either SNIPER_CONFIG_JSON (the whole config document) or GUILD_ID + VANITY plus TOKEN or EMAIL/PASSWORD."
             exit 1
           fi
-          printf '%s' "${SNIPER_CONFIG_JSON}" > config.json
           chmod 0600 config.json
           if ! jq -e 'type == "object" and has("targets") and (.targets | type == "array") and (.targets | length > 0)' config.json >/dev/null; then
-            echo "::error::SNIPER_CONFIG_JSON must be a JSON object with a non-empty targets array."
+            echo "::error::config from ${source} must be a JSON object with a non-empty targets array."
             exit 1
           fi
-          # Never echo secrets. Only non-secret shape is logged.
-          echo "config ok: $(jq -r '.targets | length' config.json) target(s), burst_count=$(jq -r '.burst_count // 5' config.json), guard_mode=$(jq -r '.guard_mode // false' config.json)"
+          # Never echo secret values. Only non-secret shape is logged.
+          echo "config from ${source}: $(jq -r '.targets | length' config.json) target(s), burst_count=$(jq -r '.burst_count // 5' config.json), guard_mode=$(jq -r '.guard_mode // false' config.json)"
+          jq -r '.targets[] | "target discord.gg/\(.vanity) guild=\(.guild_id) token=\(if .token == "" then "mint-on-start" else "present" end)"' config.json
 
       - name: Run session
         env:
