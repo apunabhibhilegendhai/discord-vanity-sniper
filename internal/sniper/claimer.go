@@ -117,6 +117,11 @@ type Claimer struct {
 	directMu           sync.Mutex
 	directBlockedUntil time.Time
 
+	// solveMu single-flights MFA ticket solves across the burst's sentries;
+	// lastSolvedTicket dedupes repeats of the same challenge.
+	solveMu          sync.Mutex
+	lastSolvedTicket string
+
 	claimStart time.Time
 
 	// firstSuccessOnce guarantees the success handler runs exactly once per
@@ -509,7 +514,8 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 			}
 			continue
 		}
-		isChunked := bytes.Contains(resp, []byte("Transfer-Encoding: chunked"))
+		isChunked := bytes.Contains(resp, []byte("Transfer-Encoding: chunked")) ||
+			bytes.Contains(resp, []byte("transfer-encoding: chunked"))
 		if isChunked {
 			if bytes.Contains(resp, []byte("\r\n0\r\n")) {
 				break
@@ -799,7 +805,21 @@ func (c *Claimer) tryClaim(t0 time.Time) {
 	// behavior was `if claimed { return }`, silently dropping every later
 	// availability signal. That meant a competitor stealing the vanity back was
 	// never re-claimed even though the gateway still fires GUILD_UPDATE.
-	if !c.guardEnabled || !guardArmed || lost {
+	// A terminal `lost` state is also a fresh opportunity: the guard exhausted
+	// its cap earlier, but this signal means the vanity is free (or held by
+	// someone else) AGAIN — give up permanently and we could lose a code that
+	// sits free forever after that. Reset the episode and take a fresh shot.
+	if lost {
+		c.target.mu.Lock()
+		c.target.lost = false
+		c.target.reclaimAttempts = 0
+		c.target.mu.Unlock()
+		log.Printf("[guard %s] vanity free again after a lost episode — taking a fresh claim", c.target.Vanity)
+		c.firstClaim()
+		return
+	}
+
+	if !c.guardEnabled || !guardArmed {
 		return
 	}
 
@@ -1054,6 +1074,18 @@ func (c *Claimer) resetSuccessGate(reclaim bool) {
 }
 
 func (c *Claimer) handleMFAChallenge(ticket string) {
+	// Single-flight per ticket: a burst of N sentries can all get 429s carrying
+	// the same challenge ticket, and each concurrent solve would either race
+	// duplicate network solves or (with backup codes) burn several limited
+	// codes on one challenge. The first goroutine solves; the rest return
+	// immediately since the result is already published via SetToken/publish.
+	c.solveMu.Lock()
+	if ticket != "" && ticket == c.lastSolvedTicket {
+		c.solveMu.Unlock()
+		return
+	}
+	defer c.solveMu.Unlock()
+
 	// Try TOTP first (primary method for accounts with TOTP enabled)
 	if c.mfa.totpSecret != "" {
 		log.Printf("[mfa %s] solving ticket via totp", c.target.Vanity)
@@ -1062,6 +1094,7 @@ func (c *Claimer) handleMFAChallenge(ticket string) {
 			c.mfa.SetToken(token, expiresIn)
 			// Re-publish bytes with the fresh token so any in-flight or next
 			// burst reads the new token via atomic load.
+			c.lastSolvedTicket = ticket
 			c.publishBytes()
 			return
 		}
@@ -1074,6 +1107,7 @@ func (c *Claimer) handleMFAChallenge(ticket string) {
 		token, expiresIn, err := c.mfa.solveBackup(ticket)
 		if err == nil && token != "" {
 			c.mfa.SetToken(token, expiresIn)
+			c.lastSolvedTicket = ticket
 			c.publishBytes()
 			return
 		}
@@ -1087,6 +1121,7 @@ func (c *Claimer) handleMFAChallenge(ticket string) {
 		token, expiresIn, err := solveTicket(ticket, c.mfa.password, c.target.Token, sp, ua, ck)
 		if err == nil && token != "" {
 			c.mfa.SetToken(token, expiresIn)
+			c.lastSolvedTicket = ticket
 			c.publishBytes()
 			return
 		}
