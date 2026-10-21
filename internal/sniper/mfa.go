@@ -291,12 +291,17 @@ func (m *MFAHandler) getTicket() (string, error) {
 	}
 	defer conn.Close()
 
-	conn.Write([]byte(req))
+	// One deadline covers the ENTIRE response. Resetting it per read would let
+	// a server that drips one byte just under the deadline keep the loop alive
+	// forever; a total deadline bounds the ticket fetch absolutely.
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return "", fmt.Errorf("write: %w", err)
+	}
 
 	var resp []byte
 	buf := make([]byte, 4096)
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	for {
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		n, err := conn.Read(buf)
 		if n > 0 {
 			resp = append(resp, buf[:n]...)
@@ -341,10 +346,11 @@ func sendSolveRequest(req string) []byte {
 		return nil
 	}
 
+	// Total deadline (see getTicket) — never reset per read.
 	var resp []byte
 	buf := make([]byte, 4096)
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	for {
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
 		n, err := conn.Read(buf)
 		if n > 0 {
 			resp = append(resp, buf[:n]...)
@@ -626,13 +632,13 @@ func (m *MFAHandler) StartRefresh(ctx CancelContext) {
 		return
 	}
 
-		const (
-			tickInterval  = 90 * time.Second
-			refreshWithin = 90 * time.Second
-		)
+	const (
+		tickInterval  = 90 * time.Second
+		refreshWithin = 90 * time.Second
+	)
 
-		log.Printf("[mfa %s] pre-solve active (interval=%s, refresh-within=%s)",
-			m.target.Vanity, tickInterval, refreshWithin)
+	log.Printf("[mfa %s] pre-solve active (interval=%s, refresh-within=%s)",
+		m.target.Vanity, tickInterval, refreshWithin)
 
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()

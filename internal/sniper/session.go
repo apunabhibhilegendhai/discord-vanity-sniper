@@ -73,13 +73,23 @@ func (s *SessionStore) Save() {
 	}
 
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		log.Printf("[session] write error: %v", err)
 		return
 	}
 	if err := os.Rename(tmp, s.path); err != nil {
-		log.Printf("[session] rename error: %v", err)
-		return
+		// Windows does not allow Rename over an existing path; fall back to a
+		// remove + rename pair (non-atomic on Windows only, atomic POSIX path
+		// stays atomic because the fallback runs only after a failed rename).
+		if removeErr := os.Remove(s.path); removeErr == nil || os.IsNotExist(removeErr) {
+			if err2 := os.Rename(tmp, s.path); err2 != nil {
+				log.Printf("[session] rename error: %v", err2)
+				return
+			}
+		} else {
+			log.Printf("[session] rename error: %v", err)
+			return
+		}
 	}
 }
 
@@ -93,15 +103,19 @@ func (s *SessionStore) AutoSave() {
 			s.Save()
 			return
 		case <-ticker.C:
-			s.mu.RLock()
+			// Clear the dirty flag BEFORE saving: a change that lands between
+			// the flag clear and this Save's snapshot sets dirty again and is
+			// persisted by the next tick. Clearing after the save used to erase
+			// a flag set by a change that landed during the save itself.
+			s.mu.Lock()
 			dirty := s.dirty
-			s.mu.RUnlock()
+			if dirty {
+				s.dirty = false
+			}
+			s.mu.Unlock()
 
 			if dirty {
 				s.Save()
-				s.mu.Lock()
-				s.dirty = false
-				s.mu.Unlock()
 			}
 		}
 	}

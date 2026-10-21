@@ -60,7 +60,7 @@ jobs:
     timeout-minutes: 30
     if: >-
       github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'test')
+      (github.event_name == 'workflow_dispatch' && (inputs.mode == 'test' || inputs.mode == 'release'))
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -113,10 +113,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name || inputs.tag }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           gh release create "${TAG}" dist/* \
             --title "${TAG}" --generate-notes
+
 
   run:
     runs-on: ubuntu-latest

@@ -126,9 +126,12 @@ func ensureTokensWith(cfg *Conf, configPath string, validate validateTokenFunc, 
 				outcomes[i] = outcome{idx: i, err: fmt.Errorf("auto-login requires 'email' in config")}
 				return
 			}
-			pwd := cfg.Password
+			// Per-target password wins (same precedence as config.go's target
+			// normalization and NewMFAHandler); the global password is the
+			// fallback.
+			pwd := t.Password
 			if pwd == "" {
-				pwd = t.Password
+				pwd = cfg.Password
 			}
 			if pwd == "" {
 				outcomes[i] = outcome{idx: i, err: fmt.Errorf("auto-login requires 'password' in config")}
