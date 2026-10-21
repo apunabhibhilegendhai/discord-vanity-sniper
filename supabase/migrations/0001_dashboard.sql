@@ -8,10 +8,15 @@
 --
 -- Apply with psql -v ON_ERROR_STOP=1. The migration is intentionally
 -- idempotent for a first install; it does not attempt destructive upgrades.
+--
+-- Hashing uses the built-in sha256(bytea) (PostgreSQL 11+) rather than
+-- pgcrypto's digest(), because self-hosted Supabase installs pgcrypto in the
+-- separate `extensions` schema. A SECURITY DEFINER function with a tight
+-- search_path (public, pg_temp) cannot see it, and widening search_path just
+-- to reach an extension is the wrong trade. gen_random_uuid() is built in
+-- since PostgreSQL 13, so this migration needs no extension at all.
 
 begin;
-
-create extension if not exists pgcrypto;
 
 -- ---------------------------------------------------------------------------
 -- Admin allow-list
@@ -188,7 +193,7 @@ begin
   select coalesce(max(version), 0) + 1 into v_next
     from public.sniper_configs;
 
-  select encode(digest(config::text, 'sha256'), 'hex') into v_before
+  select encode(sha256(convert_to(config::text, 'UTF8')), 'hex') into v_before
     from public.sniper_configs
    where active
    limit 1;
@@ -206,7 +211,7 @@ begin
     'config.save',
     'sniper_configs',
     v_before,
-    encode(digest(p_config::text, 'sha256'), 'hex'),
+    encode(sha256(convert_to(p_config::text, 'UTF8')), 'hex'),
     'ok',
     jsonb_build_object('version', v_next),
     p_ip

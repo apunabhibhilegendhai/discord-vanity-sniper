@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Push a local config.json to Supabase as a new active sniper_configs version.
+#
+# This is the non-host path for the Actions-hosted runner: the sniper config
+# (targets, tokens, guard settings) lives in Supabase, never in a GitHub
+# Actions secret. Only SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are needed
+# in CI, and the service-role key is never written to disk.
+#
+# The write goes through public.sniper_save_config(), which serializes
+# writers, deactivates the previous row, inserts the new active version and
+# records the audit entry in one transaction.
+#
+# Usage:
+#   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... ./deploy/bin/sniper-config-push [config.json]
+#
+# Environment:
+#   CONFIG_FILE   path to the config document (default: config.json or $1)
+#   NOTE          audit note recorded with the version
+set -euo pipefail
+
+CONFIG_FILE="${1:-${CONFIG_FILE:-config.json}}"
+NOTE="${NOTE:-manual push from $(hostname 2>/dev/null || echo unknown-host)}"
+
+SUPABASE_URL="${SUPABASE_URL:?SUPABASE_URL is required}"
+SUPABASE_URL="${SUPABASE_URL%/}"
+SUPABASE_SERVICE_ROLE_KEY="${SUPABASE_SERVICE_ROLE_KEY:?SUPABASE_SERVICE_ROLE_KEY is required}"
+
+command -v curl >/dev/null 2>&1 || { echo "sniper-config-push: curl is required" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "sniper-config-push: jq is required" >&2; exit 1; }
+
+if [ ! -r "$CONFIG_FILE" ]; then
+  echo "sniper-config-push: cannot read $CONFIG_FILE" >&2
+  exit 1
+fi
+
+# Reject a document the Go loader would reject anyway, before it becomes the
+# active version. Deliberately no secret values are printed.
+if ! jq -e 'type == "object" and has("targets") and (.targets | type == "array") and (.targets | length > 0)' \
+    "$CONFIG_FILE" >/dev/null; then
+  echo "sniper-config-push: $CONFIG_FILE must be a JSON object with a non-empty targets array" >&2
+  exit 1
+fi
+
+if ! jq -e 'all(.targets[]; (.guild_id // "") != "" and (.vanity // "") != "")' \
+    "$CONFIG_FILE" >/dev/null; then
+  echo "sniper-config-push: every target needs guild_id and vanity" >&2
+  exit 1
+fi
+
+# --slurpfile keeps the document out of the jq program text, so quotes and
+# backslashes in tokens or passwords cannot corrupt the payload.
+payload="$(jq -n --slurpfile cfg "$CONFIG_FILE" --arg note "$NOTE" \
+  '{p_config: $cfg[0], p_author: null, p_note: $note}')"
+
+response="$(
+  curl -fsS --max-time 30 \
+    -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+    -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    -d "$payload" \
+    "${SUPABASE_URL}/rest/v1/rpc/sniper_save_config"
+)" || {
+  echo "sniper-config-push: sniper_save_config failed (is supabase/migrations/0001_dashboard.sql applied?)" >&2
+  exit 1
+}
+
+version="$(printf '%s' "$response" | jq -r '.version // empty')"
+if [ -z "$version" ]; then
+  echo "sniper-config-push: unexpected response from sniper_save_config" >&2
+  exit 1
+fi
+
+targets="$(jq -r '.targets | length' "$CONFIG_FILE")"
+guard="$(jq -r '.guard_mode // false' "$CONFIG_FILE")"
+echo "sniper-config-push: activated version ${version} (${targets} target(s), guard_mode=${guard})"
