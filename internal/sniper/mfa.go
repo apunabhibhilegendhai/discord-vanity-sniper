@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -652,7 +653,7 @@ func (m *MFAHandler) StartRefresh(ctx CancelContext) {
 			needsRefresh := m.token == "" || time.Now().Add(refreshWithin).After(m.expiresAt)
 			m.mu.Unlock()
 			if needsRefresh {
-				refresh()
+				m.safeRefresh(refresh)
 			}
 		}
 	}
@@ -666,32 +667,48 @@ type chanCancel struct {
 	ch chan struct{}
 }
 
+// safeRefresh contains a panic in the background pre-solve. The pre-solver
+// runs netcode against live ticket/finish endpoints for the lifetime of the
+// session; a panic reaching its root would kill the process (and with it the
+// remaining Actions session window). It restarts on the next tick instead.
+func (m *MFAHandler) safeRefresh(refresh func() bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[mfa %s] recovered from panic in pre-solver: %v\n%s",
+				m.target.Vanity, r, debug.Stack())
+		}
+	}()
+	refresh()
+}
+
 func (c *chanCancel) Done() <-chan struct{} {
 	return c.ch
 }
 
 func extractTicket(resp []byte) (string, error) {
-	idx := bytes.Index(resp, []byte(`"ticket":"`))
+	// The response body may be chunked (Discord's 60003 payloads are); scan the
+	// DECODED body so a chunk-size marker at a chunk boundary can never splice
+	// itself into the middle of a ticket string.
+	body := respBody(resp)
+	idx := bytes.Index(body, []byte(`"ticket":"`))
 	if idx < 0 {
 		return "", fmt.Errorf("no ticket in response")
 	}
 	idx += 10
-	end := bytes.IndexByte(resp[idx:], '"')
+	end := bytes.IndexByte(body[idx:], '"')
 	if end < 0 {
 		return "", fmt.Errorf("malformed ticket")
 	}
-	return string(resp[idx : idx+end]), nil
+	return string(body[idx : idx+end]), nil
 }
 
 func parseFinishResponse(resp []byte) (token string, expiresIn int, err error) {
 	// Prefer a structured JSON parse so we can read both token and expires_in.
-	headerEnd := bytes.Index(resp, []byte("\r\n\r\n"))
-	var bodyBytes []byte
-	if headerEnd >= 0 {
-		bodyBytes = resp[headerEnd+4:]
-	} else {
-		bodyBytes = resp
-	}
+	// The body arrives chunked in practice, so parse the DECODED body: a raw
+	// chunked body (chunk-size markers embedded) fails the structured parse
+	// silently, and the fallback substring scan could then return a token with
+	// size-marker bytes spliced in at a chunk boundary.
+	bodyBytes := respBody(resp)
 
 	type finishResp struct {
 		Token     string `json:"token"`
@@ -715,20 +732,20 @@ func parseFinishResponse(resp []byte) (token string, expiresIn int, err error) {
 		return fr.Token, expiresIn, nil
 	}
 
-	// Fallback: manual substring scan if the body isn't clean JSON (e.g.
-	// chunked/concatenated reads).
-	idx := bytes.Index(resp, []byte(`"token":"`))
+	// Fallback: manual substring scan if the body isn't clean JSON after
+	// de-chunking (e.g. truncated reads).
+	idx := bytes.Index(bodyBytes, []byte(`"token":"`))
 	if idx < 0 {
 		// Surface the status line so a failed solve (e.g. 60008 wrong code) is
 		// diagnosable without dumping the full response body on every attempt.
 		return "", 0, fmt.Errorf("no token in response (%s)", extractStatusLine(resp))
 	}
 	idx += 9
-	end := bytes.IndexByte(resp[idx:], '"')
+	end := bytes.IndexByte(bodyBytes[idx:], '"')
 	if end < 0 {
 		return "", 0, fmt.Errorf("malformed token")
 	}
-	token = string(resp[idx : idx+end])
+	token = string(bodyBytes[idx : idx+end])
 	if exp := jwtExpiresIn(token); exp > 0 {
 		return token, exp, nil
 	}

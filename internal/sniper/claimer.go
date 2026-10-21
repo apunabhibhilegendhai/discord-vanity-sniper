@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -364,57 +365,91 @@ func (c *Claimer) sentry(pool *ConnPool, wake <-chan struct{}) {
 		case <-wake:
 		}
 
-		result := int32(-1)
-
-		// HOT PATH: atomic load of pre-built bytes, then immediate write.
-		bytesPtr := c.currentBytes.Load()
-		if bytesPtr != nil && len(*bytesPtr) > 0 {
-			reqBuf := *bytesPtr
-
-			if conn == nil {
-				conn, _ = pool.Get()
-				connAcquiredAt = time.Now()
-			}
-			if conn != nil && time.Since(connAcquiredAt) > maxIdleAge {
-				conn.Close()
-				conn, _ = pool.Get()
-				connAcquiredAt = time.Now()
-			}
-
-			ok := c.runOnce(pool, &conn, reqBuf, 0, readBuf)
-
-			// Dual-endpoint fallback: if the primary PATCH to /vanity-url failed
-			// with a non-fatal error (10008/404/400), try the legacy endpoint:
-			// PATCH /api/v9/guilds/{id} with {"code":"vanity","vanity_code":"vanity"}.
-			// This hits an older Discord code path that sometimes accepts the request
-			// when the primary endpoint returns generic errors.
-			if !ok && c.fallbackTpl != nil {
-				fbPtr := c.currentFallbackBytes.Load()
-				if fbPtr != nil && len(*fbPtr) > 0 {
-					fbBuf := *fbPtr
-					if conn == nil {
-						conn, _ = pool.Get()
-						connAcquiredAt = time.Now()
-					}
-					if conn != nil {
-						ok = c.runOnce(pool, &conn, fbBuf, 1, readBuf)
-					}
-				}
-			}
-
-			if conn == nil {
-				// closed by runOnce error path; next fire re-acquires
-			} else {
-				connAcquiredAt = time.Now()
-			}
-
-			if ok {
-				result = 1
-			}
-		}
+		// One wake→claim cycle; result -1 on panic keeps the burst protocol
+		// alive (runBurst waits for exactly one result per sentry).
+		result := c.fireOnWake(pool, &conn, &connAcquiredAt, readBuf)
 
 		c.resultCh <- result
 	}
+}
+
+// fireOnWake performs one wake→claim cycle and contains its own panics.
+//
+// Containment rationale: runBurst drains EXACTLY one result per sentry, so a
+// panic that killed the sentry goroutine would leave runBurst waiting on a
+// result that never arrives — the burst stalls until the process is killed.
+// And a panic reaching the goroutine's root kills the whole process: fine on an
+// interactive desktop, but on a 6-hour unattended Actions-hosted session one
+// malformed burst response would end the entire session window. Recovered
+// here, a bad cycle costs one wiring error and the pipeline keeps running. The
+// conn may have panicked mid-write; it is closed and niled so the next cycle
+// re-acquires.
+func (c *Claimer) fireOnWake(pool *ConnPool, connPtr *Conn, acquiredAt *time.Time, readBuf []byte) (result int32) {
+	conn := *connPtr
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[claim %s] recovered from panic on the claim hot path: %v\n%s",
+				c.target.Vanity, r, debug.Stack())
+			c.stats.AddError()
+			if conn != nil {
+				conn.Close()
+			}
+			*connPtr = nil
+			result = -1
+		}
+	}()
+
+	result = int32(-1)
+
+	// HOT PATH: atomic load of pre-built bytes, then immediate write.
+	bytesPtr := c.currentBytes.Load()
+	if bytesPtr != nil && len(*bytesPtr) > 0 {
+		reqBuf := *bytesPtr
+
+		if conn == nil {
+			conn, _ = pool.Get()
+			*acquiredAt = time.Now()
+		}
+		if conn != nil && time.Since(*acquiredAt) > maxIdleAge {
+			conn.Close()
+			conn, _ = pool.Get()
+			*acquiredAt = time.Now()
+		}
+
+		ok := c.runOnce(pool, &conn, reqBuf, 0, readBuf)
+
+		// Dual-endpoint fallback: if the primary PATCH to /vanity-url failed
+		// with a non-fatal error (10008/404/400), try the legacy endpoint:
+		// PATCH /api/v9/guilds/{id} with {"code":"vanity","vanity_code":"vanity"}.
+		// This hits an older Discord code path that sometimes accepts the request
+		// when the primary endpoint returns generic errors.
+		if !ok && c.fallbackTpl != nil {
+			fbPtr := c.currentFallbackBytes.Load()
+			if fbPtr != nil && len(*fbPtr) > 0 {
+				fbBuf := *fbPtr
+				if conn == nil {
+					conn, _ = pool.Get()
+					*acquiredAt = time.Now()
+				}
+				if conn != nil {
+					ok = c.runOnce(pool, &conn, fbBuf, 1, readBuf)
+				}
+			}
+		}
+
+		if conn == nil {
+			// closed by runOnce error path; next fire re-acquires
+		} else {
+			*acquiredAt = time.Now()
+		}
+
+		if ok {
+			result = 1
+		}
+	}
+
+	*connPtr = conn
+	return result
 }
 
 // runOnce performs one claim attempt on conn. It writes reqBuf, reads the
@@ -780,11 +815,28 @@ func (c *Claimer) claimLoop() {
 	for {
 		select {
 		case t0 := <-c.available:
-			c.tryClaim(t0)
+			c.safeTryClaim(t0)
 		case <-c.stop:
 			return
 		}
 	}
+}
+
+// safeTryClaim contains panics inside the claim episode: tryClaim →
+// firstClaim/reclaim → runBurst runs on the claim loop goroutine, and a panic
+// reaching its root would kill the whole process — ending a 6-hour
+// unattended Actions-hosted session over one malformed response. Recovered,
+// the loop keeps consuming availability signals; the failed episode counts as
+// an error.
+func (c *Claimer) safeTryClaim(t0 time.Time) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[claim %s] recovered from panic in claim path: %v\n%s",
+				c.target.Vanity, r, debug.Stack())
+			c.stats.AddError()
+		}
+	}()
+	c.tryClaim(t0)
 }
 
 func (c *Claimer) tryClaim(t0 time.Time) {
@@ -925,7 +977,7 @@ func (c *Claimer) reclaim() {
 		// audit-log fetch + kick/ban are independent of the PATCH race, so they
 		// never delay the snipe. nil-guard (guard disabled) is a no-op.
 		if c.guard != nil {
-			go c.guard.Quarantine()
+			runGuarded("quarantine", c.target.Vanity, c.stats, c.guard.Quarantine)
 		}
 	} else {
 		log.Printf("[guard %s] reclaim attempt %d/%d", c.target.Vanity, attemptNum+1, c.reclaimMax)
@@ -1151,6 +1203,25 @@ func (c *Claimer) Stop() {
 	<-c.done
 }
 
+// runGuarded launches fn in its own goroutine with panic containment. A panic
+// in a fire-and-forget goroutine (the guard quarantine, the MFA pre-solve spur)
+// would otherwise take down the whole process — on an unattended Actions-hosted
+// session that ends the 340-minute window over one bad response. The panic is
+// logged with its stack, counted as an error, and forgotten.
+func runGuarded(label, vanity string, stats *Stats, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[%s %s] recovered from panic: %v\n%s", label, vanity, r, debug.Stack())
+				if stats != nil {
+					stats.AddError()
+				}
+			}
+		}()
+		fn()
+	}()
+}
+
 func extractStatusLine(resp []byte) string {
 	end := bytes.IndexByte(resp, '\r')
 	if end < 0 {
@@ -1238,11 +1309,7 @@ func buildCookieHeader(dcfDuid, sdcfDuid, ticketCookies string) string {
 }
 
 func extractBody(resp []byte) string {
-	idx := bytes.Index(resp, []byte("\r\n\r\n"))
-	if idx < 0 {
-		return ""
-	}
-	body := bytes.TrimSpace(resp[idx+4:])
+	body := bytes.TrimSpace(respBody(resp))
 	if len(body) > 300 {
 		return string(body[:300]) + "..."
 	}

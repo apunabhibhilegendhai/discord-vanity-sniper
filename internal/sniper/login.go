@@ -200,13 +200,14 @@ func sendLoginRequest(req string) []byte {
 	return resp
 }
 
-// extractRawBody returns the HTTP body (everything after the header terminator).
+// extractRawBody returns the HTTP body (everything after the header
+// terminator), de-chunked when the response arrived with Transfer-Encoding:
+// chunked. Discord's auth endpoints respond chunked; handing the raw wire form
+// (with embedded hex chunk-size markers) to the JSON parsers corrupted
+// extraction — and could embed size-marker bytes INSIDE a token the fallback
+// scan pulled out of a chunk boundary.
 func extractRawBody(resp []byte) string {
-	idx := bytes.Index(resp, []byte("\r\n\r\n"))
-	if idx < 0 {
-		return ""
-	}
-	return string(resp[idx+4:])
+	return string(respBody(resp))
 }
 
 // extractJSONStringField pulls a top-level "field":"value" via a structured
