@@ -15,8 +15,8 @@ name: Run sniper (Actions-hosted)
 # so this runs a bounded session and dispatches its own successor. That chain is
 # not equivalent to systemd on an always-on host: every session is a fresh VM,
 # warm TLS pools and the gateway sequence are rebuilt, and there is a gap while
-# the next job queues and arms. Use deploy-sniper.yml on a `sniper-host` runner
-# for a genuinely always-on sniper.
+# the next job queues and arms. See deploy/README.md for a genuinely
+# always-on sniper via a self-hosted unit.
 
 on:
   workflow_dispatch:

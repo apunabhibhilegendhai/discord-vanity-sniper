@@ -4,7 +4,7 @@
 
 Defaults:sniper !requiretty
 
-# Config sync and the deploy workflow restart the fixed unit through this helper.
+# Config sync and the restart helper on the host restart the fixed unit.
 sniper ALL=(root) NOPASSWD: /usr/local/sbin/sniper-restart
 
 # Deploy-sniper.yml stages files in /opt/discord-sniper, then installs them here.

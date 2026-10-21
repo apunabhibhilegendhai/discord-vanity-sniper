@@ -1,5 +1,12 @@
 # GitHub Actions, Supabase, Redis, and Cloudflare Tunnel
 
+> **Update (2026-10-21):** the self-hosted deploy workflows described in §7
+> (`deploy-sniper.yml`, `deploy-dashboard.yml`, `migrate-supabase.yml`) have
+> been removed. Deployment now runs on the host through the layer in
+> [../deploy/README.md](../deploy/README.md), and the Actions-hosted chained
+> session lives in `.github/workflows/run-sniper.yml`. Sections 7.3–7.5 below
+> are kept as design record for how those workflows worked.
+
 **Status:** workflow, deploy-script, dashboard, and dashboard-migration layer implemented and locally verified. No GitHub repository, workflow run, Supabase table, Redis key, Cloudflare tunnel, DNS record, Vercel deployment, host service, or live dashboard was created. The local proof used the file store and dev auth adapter only. The upstream inventory and adaptation record is [SUPABASE_ACTIONS_ADAPTATION.md](SUPABASE_ACTIONS_ADAPTATION.md).
 
 **Date:** 2026-10-20

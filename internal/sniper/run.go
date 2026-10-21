@@ -198,5 +198,7 @@ func saveConfig(cfg *Conf, path string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	// 0600: the config holds live Discord tokens after minting; the file must
+	// never be group/world readable.
+	return os.WriteFile(path, data, 0600)
 }

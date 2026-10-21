@@ -42,7 +42,7 @@ cloudflared --version
 
 ## 2. Dedicated user and directories
 
-The workflows assume the runner and services run as `sniper`:
+The host services run as `sniper`:
 
 ```bash
 sudo useradd --system --create-home --home-dir /opt/discord-sniper \
@@ -81,7 +81,7 @@ sudo install -m 0755 deploy/bin/sniper-health /usr/local/lib/sniper/sniper-healt
 ```
 
 The sudoers file permits only the fixed install paths, `daemon-reload`, and the
-fixed-unit restart helper used by the workflows; it does not grant unrestricted
+fixed-unit restart helper used by the deploy toolchain; it does not grant unrestricted
 `sudo`. The dashboard unit and the sniper unit both use the same fixed
 `daemon-reload` entry. The dashboard unit intentionally omits
 `NoNewPrivileges=` because the restart helper needs a setuid sudo transition;
@@ -121,8 +121,8 @@ sudo systemctl enable --now sniper-config-sync.timer
 ```
 
 `cloudflared.service` skips itself until `/etc/cloudflared/tunnel.env` exists.
-Build the dashboard once (`cd dashboard && npm ci && npm run build`) or let the
-deploy workflow publish it. The config-sync timer fails until `sniper_configs`
+Build the dashboard once (`cd dashboard && npm ci && npm run build`) when
+setting the unit up. The config-sync timer fails until `sniper_configs`
 exists, so apply the migration first. `sniper-health` reads
 `$STATE_DIR/config.version` and publishes it as `applied_config_version`, so keep
 `STATE_DIR` pointing at the directory `sniper-config-sync` writes.
