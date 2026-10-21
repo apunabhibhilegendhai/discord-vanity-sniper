@@ -3,6 +3,7 @@
 package sniper
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -87,19 +88,27 @@ func TestManualMFAClaimPath(t *testing.T) {
 	}
 	t.Logf("token live ✅ (%s)", maskToken(token))
 
-	// Step 2: throwaway guild (owned by this account) as the ticket trigger.
-	gid := createThrowawayGuild(t, token, ua)
-	t.Cleanup(func() {
-		resp := sendLoginRequest(buildGuildDelete(token, gid, ua))
-		t.Logf("cleanup: DELETE guild %s -> %s", maskID(gid), extractStatusLine(resp))
-	})
+	// Step 2: pick a SAFE ticket trigger, in a no-damage ladder:
+	//   Path A — a guild the account owns that ALREADY carries a vanity. The
+	//   probe re-PATCHes the EXACT current code, so even a granted
+	//   (challenge-free) request is an exact no-op on a real server.
+	//   Path B — no such guild exists, or PATCH answers without a challenge:
+	//   create a throwaway guild (nothing snipable on it) and delete it in
+	//   cleanup.
+	gid, targetCode, throwaway := pickTicketTrigger(t, token, ua, sp)
+	if throwaway {
+		t.Cleanup(func() {
+			resp := sendLoginRequest(buildGuildDelete(token, gid, ua))
+			t.Logf("cleanup: DELETE guild %s -> %s", maskID(gid), extractStatusLine(resp))
+		})
+	}
 
-	// Step 3: ticket capture against the throwaway guild. A 60003 challenge
+	// Step 3: ticket capture against the chosen trigger. A 60003 challenge
 	// response is EXPECTED and fully benign (the request is rejected pending
-	// MFA, nothing on the guild changes).
+	// MFA — nothing on the guild changes).
 	m := NewMFAHandler(&Target{
 		GuildID: gid,
-		Vanity:  "zsnp0mfa",
+		Vanity:  targetCode,
 		Token:   token,
 	}, NewSessionStore(""), "", totpSecret, nil, &cfg.Fingerprint)
 
@@ -135,21 +144,63 @@ func TestManualMFAClaimPath(t *testing.T) {
 	t.Logf("claim header %s: %s (%d chars)", name, maskID(val), len(val))
 }
 
-// createThrowawayGuild POSTs a minimal guild owned by the probed account and
-// returns its snowflake, so the ticket PATCH has a scope we can discard.
-func createThrowawayGuild(t *testing.T, token, ua string) string {
+// guildLite / vanityResp parse just the fields the trigger ladder needs.
+type guildLite struct {
+	ID    string `json:"id"`
+	Owner bool   `json:"owner"`
+}
+
+type vanityResp struct {
+	Code *string `json:"code"`
+}
+
+// pickTicketTrigger resolves (guild id, vanity code) for the MFA ticket PATCH
+// and reports whether that guild is a throwaway (delete-on-cleanup).
+//
+// Path A (real guild): owned guild that already has a vanity; the PATCH
+// re-sends that exact code, so any granted request is an identity no-op. This
+// never creates or deletes anything on the account.
+//
+// Path B (throwaway): no owned+vanity guild exists, or the same-code PATCH was
+// granted without a challenge — a fresh guild is created purely as the probe
+// scope and removed by the returned cleanup.
+func pickTicketTrigger(t *testing.T, token, ua, sp string) (gid string, code string, throwaway bool) {
+	// Path A.
+	resp := sendLoginRequest(rawGuildReq("GET", "/api/v9/users/@me/guilds", token, "", ua, sp))
+	var guilds []guildLite
+	if err := json.Unmarshal([]byte(extractRawBody(resp)), &guilds); err == nil {
+		for _, g := range guilds {
+			if !g.Owner || g.ID == "" {
+				continue
+			}
+			vresp := sendLoginRequest(rawGuildReq("GET", "/api/v9/guilds/"+g.ID+"/vanity-url", token, "", ua, sp))
+			var vr vanityResp
+			if json.Unmarshal([]byte(extractRawBody(vresp)), &vr) == nil && vr.Code != nil && *vr.Code != "" {
+				// Confirm the PATCH actually interposes an MFA challenge; a
+				// granted same-code request (recent-solve grace) cannot act
+				// as a ticket trigger.
+				probe := sendLoginRequest(rawGuildReqPatchVanity(g.ID, *vr.Code, token, ua, sp))
+				if parseStatusCode(probe)/100 != 2 && strings.Contains(string(respBody(probe)), "ticket") {
+					t.Logf("trigger: owned guild %s (vanity re-set of its current code — a guaranteed no-op)", maskID(g.ID))
+					return g.ID, *vr.Code, false
+				}
+				t.Logf("guild %s PATCH did not interpose a challenge (%s) — trying the next guild", maskID(g.ID), extractStatusLine(probe))
+			}
+		}
+	} else {
+		t.Logf("guild list unavailable (%s: %v)", extractStatusLine(resp), err)
+	}
+
+	// Path B.
+	tgid := createThrowawayTrigger(t, token, ua, sp)
+	return tgid, "zsnp0mfa", true
+}
+
+// createThrowawayTrigger POSTs a minimal guild owned by the probed account so
+// the ticket PATCH has a scope we can discard.
+func createThrowawayTrigger(t *testing.T, token, ua, sp string) string {
 	t.Helper()
-	body := `{"name":"sniper-mfa-probe"}`
-	req := fmt.Sprintf("POST /api/v9/guilds HTTP/1.1\r\n"+
-		"Host: discord.com\r\n"+
-		"Authorization: %s\r\n"+
-		"Content-Type: application/json\r\n"+
-		"Content-Length: %d\r\n"+
-		"X-Discord-Locale: en-US\r\n"+
-		"User-Agent: %s\r\n"+
-		"Accept: */*\r\n"+
-		"Connection: close\r\n\r\n%s", token, len(body), ua, body)
-	resp := sendLoginRequest(req)
+	resp := sendLoginRequest(rawGuildReq("POST", "/api/v9/guilds", token, `{"name":"sniper-mfa-probe"}`, ua, sp))
 	if parseStatusCode(resp)/100 != 2 {
 		t.Fatalf("throwaway guild create failed: %s (%s)", extractStatusLine(resp), extractBody(resp))
 	}
@@ -157,7 +208,50 @@ func createThrowawayGuild(t *testing.T, token, ua string) string {
 	if gid == "" {
 		t.Fatalf("guild create returned no id: %s", extractBody(resp))
 	}
+	t.Logf("throwaway guild created: %s (removed on cleanup)", maskID(gid))
 	return gid
+}
+
+// rawGuildReq builds a JSON request to discord.com with a browser-credible
+// header set. The set mirrors minimal browser traffic: X-Super-Properties,
+// origin context, Sec-Fetch-*, Accept-Language — the bare header set (api-raw
+// style) gets treated as scripted traffic on some endpoints.
+func rawGuildReq(method, path, token, body, ua, sp string) string {
+	sb := new(strings.Builder)
+	fmt.Fprintf(sb, "%s %s HTTP/1.1\r\n", method, path)
+	sb.WriteString("Host: discord.com\r\n")
+	if token != "" {
+		fmt.Fprintf(sb, "Authorization: %s\r\n", token)
+	}
+	if body != "" {
+		sb.WriteString("Content-Type: application/json\r\n")
+		fmt.Fprintf(sb, "Content-Length: %d\r\n", len(body))
+	}
+	if sp != "" {
+		fmt.Fprintf(sb, "X-Super-Properties: %s\r\n", sp)
+	}
+	if ua != "" {
+		fmt.Fprintf(sb, "User-Agent: %s\r\n", ua)
+	}
+	sb.WriteString("X-Discord-Locale: en-US\r\n")
+	sb.WriteString("X-Context-Properties: eyJsb2NhdGlvbiI6IkdpbGQgU2V0dGluZ3MifQ==\r\n") // {"location":"Guild Settings"}
+	sb.WriteString("Origin: https://discord.com\r\n")
+	sb.WriteString("Referer: https://discord.com/channels/@me\r\n")
+	sb.WriteString("Accept: */*\r\n")
+	sb.WriteString("Accept-Language: en-US,en;q=0.9\r\n")
+	sb.WriteString("Sec-Fetch-Site: same-origin\r\n")
+	sb.WriteString("Sec-Fetch-Mode: cors\r\n")
+	sb.WriteString("Sec-Fetch-Dest: empty\r\n")
+	sb.WriteString("Connection: close\r\n\r\n")
+	sb.WriteString(body)
+	return sb.String()
+}
+
+// rawGuildReqPatchVanity identifies the PATCH specifically: same header set as
+// the trigger probe, with the vanity body.
+func rawGuildReqPatchVanity(gid, code, token, ua, sp string) string {
+	body := fmt.Sprintf(`{"code":"%s"}`, code)
+	return rawGuildReq("PATCH", "/api/v9/guilds/"+gid+"/vanity-url", token, body, ua, sp)
 }
 
 func buildGuildDelete(token, gid, ua string) string {
