@@ -6,6 +6,45 @@ The dashboard lives in [`../dashboard`](../dashboard/README.md) and its schema i
 [`../supabase/migrations/0001_dashboard.sql`](../supabase/migrations/0001_dashboard.sql).
 Apply the migration and build the dashboard before enabling those services.
 
+## 0. GitHub-hosted Actions sessions (no always-on host needed)
+
+The primary deployment shape does not need this directory at all: one workflow
+([../.github/workflows/sniper.yml](../.github/workflows/sniper.yml)) runs
+everything on GitHub-hosted runners, and the sniper config lives in Supabase —
+never in Action secrets.
+
+1. Host or register a Supabase instance and apply
+   [`supabase/migrations/0001_dashboard.sql`](../supabase/migrations/0001_dashboard.sql).
+2. Repository secrets (Settings → Secrets and variables → Actions):
+   - `SUPABASE_URL` — the instance base URL
+   - `SUPABASE_SERVICE_ROLE_KEY` — server-side key, RLS denies anon/authenticated
+   - `SUPABASE_ANON_KEY` — public heartbeat key (health mode only)
+3. Push the active config document (Go `Conf` JSON shape, snake_case keys) as a
+   new versioned row through either the dashboard or:
+   ```bash
+   SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... \
+     ./deploy/bin/sniper-config-push config.json
+   ```
+4. Start a session: **Actions → Sniper → Run workflow → mode `run`**. Sessions
+   chain themselves (~345m each, dispatch of the successor just before exit,
+   prevented from queueing twice while one is alive); a 6-hour watchdog cron
+   restarts the chain if it ever breaks, and an unexpected mid-session exit
+   chains a recovery session after a 5-minute cool-off.
+5. Job logs are public on a public repository: run mode sets
+   `SNIPER_REDACT_LOGS=1`, so the sniper masks guild ids, vanity codes, tokens,
+   proxies and other config-borne credentials in its log output. Local runs keep
+   full detail unless the same variable is set.
+
+Note the environment the Actions runner provides: an ephemeral,
+GitHub-egress-IP host with a cold connection pool and fresh gateway session per
+session start (no resume across sessions), and Discord sees datacenter-range
+IPs — expect a higher anti-abuse baseline than a residential host, and configure
+proxies in the Supabase config document if that matters for your targets.
+
+The remainder of this file documents the optional always-on host layer
+(systemd + tunnel + health sidecar) that complements — or replaces — the
+Actions-hosted sessions.
+
 ## 1. Host packages
 
 The self-hosted runner and the host services need:

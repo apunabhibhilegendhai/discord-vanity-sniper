@@ -7,6 +7,15 @@ name: Sniper
 #   run     - Actions-hosted chained sniper session (~345m) with a 6h watchdog
 #   health  - public heartbeat probe against Supabase Auth every 5 minutes
 #
+# Run-mode session contract:
+#   * config comes from Supabase (never from Action secrets)
+#   * SNIPER_REDACT_LOGS=1 masks guild ids/vanity codes/tokens/proxies from the
+#     job log, because this repository is public and Actions logs are public
+#   * the session ends via SIGINT from `timeout`; the sniper flushes sessions,
+#     sends the shutdown webhook and exits cleanly (rc 124 = window ended)
+#   * an unexpected mid-session exit waits out a 5-minute cool-off and then
+#     chains the successor immediately instead of waiting for the 6h watchdog
+#
 # Trigger routing:
 #
 #   push / pull_request              -> test
@@ -188,6 +197,10 @@ jobs:
       - name: Run session
         env:
           SESSION_MINUTES: ${{ inputs.session_minutes || '345' }}
+          # Public repo, public logs: the sniper masks every credential the
+          # config carries (tokens, guild ids, vanity codes, proxies, email)
+          # from its log output.
+          SNIPER_REDACT_LOGS: "1"
         run: |
           case "${SESSION_MINUTES}" in
             ''|*[!0-9]*) echo "::error::session_minutes must be an integer"; exit 1 ;;
@@ -208,8 +221,17 @@ jobs:
             echo "::notice::session window ended after ${SESSION_MINUTES}m; chaining the next session"
             exit 0
           fi
-          echo "::error::sniper exited unexpectedly with status ${rc}"
-          exit "${rc}"
+          if [ "${rc}" -eq 0 ]; then
+            echo "::notice::sniper exited cleanly (shutdown signal handled); chaining the next session"
+            exit 0
+          fi
+          # Unexpected exit (a panic that escaped containment, an unrecoverable
+          # network state, a hard kill). Chain the successor after a cool-off so
+          # downtime is minutes, not up to 6h until the next watchdog tick. The
+          # cool-off also rate-limits a debounced crash-loop.
+          echo "::warning::sniper exited unexpectedly with status ${rc}; chaining a recovery session after a 5m cool-off"
+          sleep 300
+          exit 0
 
       - name: Session summary
         if: always()
