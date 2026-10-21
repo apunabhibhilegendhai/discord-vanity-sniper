@@ -150,6 +150,7 @@ jobs:
           MFA_TEST_EMAIL: ${{ secrets.MFA_TEST_EMAIL }}
           MFA_TEST_PASSWORD: ${{ secrets.MFA_TEST_PASSWORD }}
           MFA_TEST_TOTP: ${{ secrets.MFA_TEST_TOTP }}
+          MFA_TEST_TOKEN: ${{ secrets.MFA_TEST_TOKEN }}
         run: |
           for v in MFA_TEST_EMAIL MFA_TEST_PASSWORD MFA_TEST_TOTP; do
             if [ -z "${!v}" ]; then
@@ -157,7 +158,17 @@ jobs:
               exit 1
             fi
           done
-          go test -tags=manual -run TestManualMFAFlow -v -count=1 ./internal/sniper
+          # With MFA_TEST_TOKEN the claim-path probe runs (ticket capture on a
+          # throwaway guild created+deleted by the test, TOTP solve, claim
+          # header assembly) and the login probe is skipped — login from
+          # GitHub's datacenter IPs is hCaptcha-gated by Discord and would fail
+          # regardless of the TOTP secret. Without a token, only the login
+          # flow runs.
+          if [ -n "${MFA_TEST_TOKEN}" ]; then
+            go test -tags=manual -run TestManualMFAClaimPath -v -count=1 ./internal/sniper
+          else
+            go test -tags=manual -run TestManualMFAFlow -v -count=1 ./internal/sniper
+          fi
 
   run:
     runs-on: ubuntu-latest
