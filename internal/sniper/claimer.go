@@ -597,8 +597,9 @@ func (c *Claimer) runOnce(pool *ConnPool, connPtr *Conn, reqBuf []byte, attempt 
 		}
 
 		if attempt < 3 {
-			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
-			c.rateLim.Wait(rlKey)
+			// Wait out the delay Discord stated; the fixed pause applies only when
+			// the response states none.
+			c.rateLim.WaitRetry(rlKey, resp, attempt)
 			// Reload bytes: the solve above may have rotated the token.
 			bytesPtr := c.currentBytes.Load()
 			if bytesPtr == nil || len(*bytesPtr) == 0 {

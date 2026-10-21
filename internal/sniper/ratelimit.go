@@ -1,6 +1,7 @@
 package sniper
 
 import (
+	"bytes"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,6 +83,61 @@ func (r *RateLimiter) WaitGlobal() {
 		r.mu.Unlock()
 		return
 	}
+}
+
+// WaitRetry waits out a 429 retry: Discord's JSON retry_after when the response
+// states one, otherwise a fixed attempt-scaled pause so a bare 429 cannot become
+// an immediate retry storm, then the bucket's Retry-After window.
+func (r *RateLimiter) WaitRetry(key string, resp []byte, attempt int) {
+	if wait, stated := jsonRetryAfter(resp); stated {
+		if wait > 0 {
+			b := r.GetBucket(key)
+			b.mu.Lock()
+			if until := time.Now().Add(time.Duration(wait * float64(time.Second))); until.After(b.backoff) {
+				b.backoff = until
+			}
+			b.mu.Unlock()
+		}
+	} else if !r.backoffPending(key) {
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	}
+	r.Wait(key)
+}
+
+func (r *RateLimiter) backoffPending(key string) bool {
+	b := r.GetBucket(key)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return time.Now().Before(b.backoff)
+}
+
+// jsonRetryAfter returns Discord's JSON retry_after in seconds, and whether the
+// field was present at all: a stated 0 means "retry now".
+func jsonRetryAfter(resp []byte) (float64, bool) {
+	idx := bytes.Index(resp, []byte("\r\n\r\n"))
+	if idx < 0 {
+		return 0, false
+	}
+	body := resp[idx+4:]
+	k := bytes.Index(body, []byte(`"retry_after":`))
+	if k < 0 {
+		return 0, false
+	}
+	rest := bytes.TrimLeft(body[k+len(`"retry_after":`):], " ")
+	end := 0
+	for end < len(rest) {
+		switch rest[end] {
+		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '-', '+', 'e', 'E':
+			end++
+			continue
+		}
+		break
+	}
+	v, err := strconv.ParseFloat(string(rest[:end]), 64)
+	if end == 0 || err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 func (r *RateLimiter) HandleResponse(key string, headers []string) {
