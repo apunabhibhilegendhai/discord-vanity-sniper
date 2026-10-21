@@ -6,6 +6,8 @@ name: Sniper
 #   release - linux amd64+arm64 binaries published to a v* tag release
 #   run     - Actions-hosted chained sniper session (~345m) with a 6h watchdog
 #   health  - public heartbeat probe against Supabase Auth every 5 minutes
+#   mfa-test- one-shot login→TOTP→token-mint→validate diagnostic; no guild is
+#             touched and nothing is sniped
 #
 # Run-mode session contract:
 #   * config comes from Supabase (never from Action secrets)
@@ -42,11 +44,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "What to run: test | release | run | health"
+        description: "What to run: test | release | run | health | mfa-test"
         required: false
         default: "test"
         type: choice
-        options: [test, release, run, health]
+        options: [test, release, run, health, mfa-test]
       session_minutes:
         description: "(run mode) Minutes per session before chaining the next (max 350)"
         required: false
@@ -127,6 +129,35 @@ jobs:
           gh release create "${TAG}" dist/* \
             --title "${TAG}" --generate-notes
 
+
+  mfa-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'mfa-test'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # One-shot MFA login diagnostic: POST /auth/login (email+password) →
+      # MFA ticket → POST /auth/mfa/totp → minted user token → GET /users/@me
+      # validation, then a second mint to exercise the repeat path. Nothing
+      # beyond the login endpoints is touched — no guild, no claim. GitHub
+      # masks the secret literals wherever they would appear in the log.
+      - name: MFA login diagnostic
+        env:
+          MFA_TEST_EMAIL: ${{ secrets.MFA_TEST_EMAIL }}
+          MFA_TEST_PASSWORD: ${{ secrets.MFA_TEST_PASSWORD }}
+          MFA_TEST_TOTP: ${{ secrets.MFA_TEST_TOTP }}
+        run: |
+          for v in MFA_TEST_EMAIL MFA_TEST_PASSWORD MFA_TEST_TOTP; do
+            if [ -z "${!v}" ]; then
+              echo "::error::missing repository secret ${v}"
+              exit 1
+            fi
+          done
+          go test -tags=manual -run TestManualMFAFlow -v -count=1 ./internal/sniper
 
   run:
     runs-on: ubuntu-latest
