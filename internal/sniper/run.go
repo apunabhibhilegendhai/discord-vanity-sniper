@@ -25,6 +25,13 @@ func Main() {
 		log.Fatalf("config: %v", err)
 	}
 
+	// Redact config-borne credentials from log output when running in a shared
+	// log stream (the Actions-hosted session sets SNIPER_REDACT_LOGS=1; local
+	// runs keep full detail). Must install before any other code logs.
+	if installLogRedaction(cfg) {
+		log.Printf("[startup] log redaction ENABLED (SNIPER_REDACT_LOGS) — guild ids, vanity codes, tokens and other credentials are masked in this output")
+	}
+
 	// Log the resolved browser profile so fingerprint drift is visible at
 	// startup. activeProfile is set by ResolveFingerprint inside LoadConfig; if
 	// it's nil something is wrong with config resolution and downstream TLS
