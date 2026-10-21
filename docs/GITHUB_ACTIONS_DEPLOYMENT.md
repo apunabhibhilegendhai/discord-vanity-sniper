@@ -3,9 +3,11 @@
 > **Update (2026-10-21):** the self-hosted deploy workflows described in §7
 > (`deploy-sniper.yml`, `deploy-dashboard.yml`, `migrate-supabase.yml`) have
 > been removed. Deployment now runs on the host through the layer in
-> [../deploy/README.md](../deploy/README.md), and the Actions-hosted chained
-> session lives in `.github/workflows/run-sniper.yml`. Sections 7.3–7.5 below
-> are kept as design record for how those workflows worked.
+> [../deploy/README.md](../deploy/README.md), and the four remaining
+> workflows (`ci.yml`, `release.yml`, `run-sniper.yml`, `health-check.yml`)
+> were merged into one: `sniper.yml`, which routes `test` / `release` / `run`
+> / `health` modes by trigger. Sections 7.3–7.5 below are kept as design
+> record for how those workflows worked.
 
 **Status:** workflow, deploy-script, dashboard, and dashboard-migration layer implemented and locally verified. No GitHub repository, workflow run, Supabase table, Redis key, Cloudflare tunnel, DNS record, Vercel deployment, host service, or live dashboard was created. The local proof used the file store and dev auth adapter only. The upstream inventory and adaptation record is [SUPABASE_ACTIONS_ADAPTATION.md](SUPABASE_ACTIONS_ADAPTATION.md).
 
@@ -257,11 +259,7 @@ A Go binary can execute on an `ubuntu-latest` runner because the runner is a nor
 
 ```text
 GitHub (Actions)
-  ├── ci.yml                 build / vet / test / tagged compile
-  ├── release.yml            Linux binary artifact
-  ├── deploy-sniper.yml      self-hosted runner: install + restart
-  ├── deploy-dashboard.yml   self-hosted runner: build + restart
-  └── migrate-supabase.yml   self-hosted runner: psql migrations
+  └── sniper.yml             test / release / run / health, routed by trigger
              |
              v
 Always-on host
@@ -289,16 +287,11 @@ If the user does not want a self-hosted runner, the deploy workflow must use SSH
 
 ## 6. Implementation map
 
-The six workflows, the `deploy/` layer, `dashboard/**`, and `supabase/migrations/0001_dashboard.sql` now exist in this repository. The remaining work is host provisioning, applying the migration, building the dashboard, and creating the Tunnel/DNS resources. Generated files such as `next-env.d.ts` are not listed.
+The `deploy/` layer, `dashboard/**`, and `supabase/migrations/0001_dashboard.sql` exist in this repository. The one remaining workflow is `sniper.yml`; the six workflows listed here previously were consolidated into it on removal of the self-hosted deploy path. The remaining work is host provisioning, applying the migration, building the dashboard, and creating the Tunnel/DNS resources. Generated files such as `next-env.d.ts` are not listed.
 
-| Path | Purpose |
+| Path | Purpose (historical; see the update banner) |
 |---|---|
-| `.github/workflows/ci.yml` | Build, vet, test, and tagged compile on push/PR; no secrets |
-| `.github/workflows/release.yml` | Build Linux amd64/arm64 binaries on a tag; upload artifacts/release |
-| `.github/workflows/deploy-sniper.yml` | Self-hosted deploy of binary and systemd unit; protected environment |
-| `.github/workflows/deploy-dashboard.yml` | Self-hosted build/deploy of the dashboard; protected environment |
-| `.github/workflows/migrate-supabase.yml` | Self-hosted `psql` migration against the local Postgres only |
-| `.github/workflows/health-check.yml` | Optional 5-minute public probe; no local DB/Redis access |
+| `.github/workflows/sniper.yml` | One workflow: build/vet/test (push, PR), release binaries (v* tag), chained session (`run`), heartbeat (`health`)|
 | `deploy/systemd/discord-sniper.service` | Runs the Go binary as an always-on service |
 | `deploy/systemd/sniper-dashboard.service` | Runs the dashboard on `127.0.0.1:3000` |
 | `deploy/systemd/sniper-config-sync.service` | Applies the active Supabase config to `config.json` |

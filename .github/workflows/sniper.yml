@@ -1,5 +1,20 @@
-name: Run sniper (Actions-hosted)
+name: Sniper
 
+# One workflow for everything under .github/workflows:
+#
+#   test    - go build / vet / test (+ tagged harness compiles) on push and PR
+#   release - linux amd64+arm64 binaries published to a v* tag release
+#   run     - Actions-hosted chained sniper session (~345m) with a 6h watchdog
+#   health  - public heartbeat probe against Supabase Auth every 5 minutes
+#
+# Trigger routing:
+#
+#   push / pull_request              -> test
+#   push of a v* tag                 -> test + release
+#   workflow_dispatch (mode input)   -> the chosen mode
+#   schedule "17 */6 * * *"          -> run (chain watchdog)
+#   schedule "*/5 * * * *"           -> health
+#
 # The sniper configuration lives in Supabase, not in GitHub Actions secrets.
 # `sniper_configs` holds the versioned document (targets, tokens, Vanity Guard
 # settings); only the infrastructure credentials needed to reach Supabase are
@@ -7,45 +22,116 @@ name: Run sniper (Actions-hosted)
 #
 #   SUPABASE_URL               the instance base URL
 #   SUPABASE_SERVICE_ROLE_KEY  server-side key; RLS denies anon and authenticated
+#   SUPABASE_ANON_KEY          public heartbeat probe key (health mode only)
 #
 # `deploy/bin/sniper-config-push` writes a new active version, and the dashboard
 # does the same through public.sniper_save_config().
-#
-# GitHub-hosted jobs are capped at six hours and the VM is destroyed at the end,
-# so this runs a bounded session and dispatches its own successor. That chain is
-# not equivalent to systemd on an always-on host: every session is a fresh VM,
-# warm TLS pools and the gateway sequence are rebuilt, and there is a gap while
-# the next job queues and arms. See deploy/README.md for a genuinely
-# always-on sniper via a self-hosted unit.
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "What to run: test | release | run | health"
+        required: false
+        default: "test"
+        type: choice
+        options: [test, release, run, health]
       session_minutes:
-        description: "Minutes to run before chaining the next session (max 350)"
+        description: "(run mode) Minutes per session before chaining the next (max 350)"
         required: false
         default: "345"
+      tag:
+        description: "(release mode) Tag to publish to; required for release mode"
+        required: false
   schedule:
-    # Watchdog: starts a session every 6 hours if the chain ever breaks.
+    # Session watchdog: starts a chained session if the chain ever breaks.
     - cron: "17 */6 * * *"
+    # Public heartbeat probe.
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: read
 
-concurrency:
-  # One session at a time. The successor is dispatched just before this job
-  # exits, so it waits here instead of racing the running sniper.
-  group: sniper-session
-  cancel-in-progress: false
-
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: >-
+      github.event_name == 'push' || github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'test')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - run: go test -tags=live -run '^$' ./...
+      - run: go test -tags=realnet -run '^$' ./...
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'release' && inputs.tag != '')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go build -ldflags="-s -w" -o sniper-linux-${{ matrix.goarch }} .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sniper-linux-${{ matrix.goarch }}
+          path: sniper-linux-${{ matrix.goarch }}
+
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name || inputs.tag }}
+        run: |
+          gh release create "${TAG}" dist/* \
+            --title "${TAG}" --generate-notes
+
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    concurrency:
+      # One session at a time. The successor is dispatched just before this job
+      # exits, so it waits here instead of racing the running sniper.
+      group: sniper-session
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: write # required to dispatch the next session
-
+    if: >-
+      github.event_name == 'schedule' && github.event.schedule == '17 */6 * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'run')
     steps:
       - uses: actions/checkout@v4
 
@@ -106,7 +192,7 @@ jobs:
             ''|*[!0-9]*) echo "::error::session_minutes must be an integer"; exit 1 ;;
           esac
           if [ "${SESSION_MINUTES}" -gt 350 ]; then
-            echo "session_minutes capped to 350 (job limit is 360)"
+            echo "::error::session_minutes capped to 350 (job limit is 360)"
             SESSION_MINUTES=350
           fi
           seconds=$(( SESSION_MINUTES * 60 ))
@@ -144,7 +230,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          WF: run-sniper.yml
+          WF: sniper.yml
           REF: ${{ github.ref_name }}
         run: |
           # The cron watchdog can queue a run while this session is still
@@ -156,5 +242,22 @@ jobs:
             exit 0
           fi
           gh workflow run "${WF}" --repo "${GH_REPO}" --ref "${REF}" \
-            -f session_minutes=345
+            -f mode=run -f session_minutes=345
           echo "dispatched the next session"
+
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: >-
+      github.event_name == 'schedule' && github.event.schedule == '*/5 * * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'health')
+    steps:
+      - name: Probe public Supabase
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || 'https://supabase.opendrive.indevs.in' }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          : "${SUPABASE_ANON_KEY:?missing SUPABASE_ANON_KEY}"
+          curl -fsS --max-time 15 \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            "${SUPABASE_URL}/auth/v1/settings" >/dev/null
